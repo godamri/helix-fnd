@@ -1,53 +1,45 @@
 package log
 
 import (
-	"context"
 	"log/slog"
 	"os"
+	"time"
 
-	"go.opentelemetry.io/otel/trace"
+	"github.com/lmittmann/tint"
 )
 
-// Config holds logger configuration
 type Config struct {
-	Level  string `envconfig:"LOG_LEVEL" default:"info"`
-	Format string `envconfig:"LOG_FORMAT" default:"json"` // json or text
+	Level  string `envconfig:"LOG_LEVEL" default:"info"`  // debug, info, warn, error
+	Format string `envconfig:"LOG_FORMAT" default:"json"` // json, console
 }
 
-// New creates a production-ready logger.
 func New(cfg Config) *slog.Logger {
 	var level slog.Level
-	if err := level.UnmarshalText([]byte(cfg.Level)); err != nil {
+	switch cfg.Level {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
 		level = slog.LevelInfo
 	}
 
-	opts := &slog.HandlerOptions{
-		Level:     level,
-		AddSource: true, // Crucial for debugging distributed systems
-	}
-
 	var handler slog.Handler
-	if cfg.Format == "json" {
-		handler = slog.NewJSONHandler(os.Stdout, opts)
+
+	if cfg.Format == "console" {
+		// Pretty Print for Local Development
+		handler = tint.NewHandler(os.Stdout, &tint.Options{
+			Level:      level,
+			TimeFormat: time.TimeOnly,
+		})
 	} else {
-		handler = slog.NewTextHandler(os.Stdout, opts)
+		// JSON for Production (Machine Readable)
+		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: level,
+		})
 	}
 
-	return slog.New(&TraceHandler{Handler: handler})
-}
-
-// TraceHandler wraps the standard handler to inject OTel TraceIDs automatically.
-type TraceHandler struct {
-	slog.Handler
-}
-
-func (h *TraceHandler) Handle(ctx context.Context, r slog.Record) error {
-	span := trace.SpanFromContext(ctx)
-	if span.SpanContext().IsValid() {
-		r.AddAttrs(
-			slog.String("trace_id", span.SpanContext().TraceID().String()),
-			slog.String("span_id", span.SpanContext().SpanID().String()),
-		)
-	}
-	return h.Handler.Handle(ctx, r)
+	return slog.New(handler)
 }
