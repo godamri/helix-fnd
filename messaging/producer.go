@@ -2,7 +2,6 @@ package messaging
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -36,26 +35,16 @@ func NewProducer(cfg Config, logger *slog.Logger) (*Producer, error) {
 }
 
 // Publish sends a message to Kafka with OTel Trace Context injection.
-func (p *Producer) Publish(ctx context.Context, topic, key string, payload interface{}) error {
-	bytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("kafka: payload marshal error: %w", err)
-	}
-
+// CHANGED: Payload is now []byte to match Worker interface and avoid implicit marshaling.
+func (p *Producer) Publish(ctx context.Context, topic, key string, payload []byte) error {
 	msg := &sarama.ProducerMessage{
 		Topic:     topic,
 		Key:       sarama.StringEncoder(key),
-		Value:     sarama.ByteEncoder(bytes),
+		Value:     sarama.ByteEncoder(payload),
 		Timestamp: time.Now(),
 	}
 
 	// OTel Injection
-	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier{
-		// sarama headers are []RecordHeader, we need to adapt manually
-	})
-
-	// Manual propagation adapter because Sarama doesn't have a built-in one for OTel MapCarrier
-	// We iterate the carrier and append to headers
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
 
