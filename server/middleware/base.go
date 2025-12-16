@@ -3,25 +3,10 @@ package middleware
 import (
 	"log/slog"
 	"net/http"
-	"runtime/debug"
 	"time"
 
 	"github.com/riandyrn/otelchi"
 )
-
-// PanicRecovery ensures the server doesn't crash on unhandled panics.
-// It logs the stack trace and returns 500.
-func PanicRecovery(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				slog.ErrorCtx(r.Context(), "panic recovered", "error", err, "stack", string(debug.Stack()))
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
 
 // SecurityHeaders adds basic security headers.
 func SecurityHeaders(next http.Handler) http.Handler {
