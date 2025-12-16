@@ -1,0 +1,49 @@
+# Binaries
+# --------------------
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+dist/
+
+# Test & Coverage
+# --------------------
+profile.out
+coverage.out
+coverage.html
+
+# IDEs & Editors
+# --------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS Specific
+# --------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Go Workspace (Local Dev)
+# --------------------
+# Jangan commit go.work kecuali lo emang mau enforce workspace structure ke tim lain.
+# Biasanya buat library murni, ini di-ignore.
+go.work
+go.work.sum
+
+# Environment Variables
+# --------------------
+.env
+.env.*
+!.env.example
+*.sh
