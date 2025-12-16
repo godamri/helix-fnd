@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/godamri/helix-fnd/audit"
 	"github.com/godamri/helix-fnd/pkg/contextx"
 )
@@ -32,7 +33,7 @@ func AuditMiddleware(logger audit.Logger) func(http.Handler) http.Handler {
 				r.Body = io.NopCloser(bytes.NewBuffer(reqBody))
 			}
 
-			ww := NewWrapResponseWriter(w, r.ProtoMajor)
+			ww := chiMiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
 
 			next.ServeHTTP(ww, r)
 
