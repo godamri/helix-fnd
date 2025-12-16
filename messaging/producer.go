@@ -68,11 +68,11 @@ func (p *Producer) Publish(ctx context.Context, topic, key string, payload inter
 
 	partition, offset, err := p.producer.SendMessage(msg)
 	if err != nil {
-		p.logger.ErrorCtx(ctx, "kafka publish failed", "topic", topic, "error", err)
+		p.logger.ErrorContext(ctx, "kafka publish failed", "topic", topic, "error", err)
 		return err
 	}
 
-	p.logger.DebugCtx(ctx, "kafka publish success", "topic", topic, "partition", partition, "offset", offset)
+	p.logger.DebugContext(ctx, "kafka publish success", "topic", topic, "partition", partition, "offset", offset)
 	return nil
 }
 
