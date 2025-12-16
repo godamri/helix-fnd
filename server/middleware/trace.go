@@ -3,7 +3,7 @@ package middleware
 import (
 	"net/http"
 
-	"github.com/godamri/helix-fnd/contextx"
+	"github.com/godamri/helix-fnd/pkg/contextx"
 	"github.com/google/uuid"
 )
 
