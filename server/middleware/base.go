@@ -33,7 +33,7 @@ func LoggerMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(ww, r)
 
-		slog.InfoCtx(r.Context(), "http_request",
+		slog.InfoContext(r.Context(), "http_request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", ww.status,
