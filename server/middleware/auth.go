@@ -3,92 +3,105 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 
-	"github.com/godamri/helix-fnd/crypto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
-// AuthPrincipalIDKey and AuthPrincipalTypeKey should be defined in a shared context package
-// but for Foundation integrity we define context keys here if not present.
+// --- Context Keys (The Single Source of Truth) ---
 type contextKey string
 
 const (
-	AuthPrincipalIDKey   contextKey = "helix_auth_principal_id"
-	AuthPrincipalTypeKey contextKey = "helix_auth_principal_type"
+	AuthPrincipalIDKey    contextKey = "helix_auth_principal_id"    // string (UUID)
+	AuthPrincipalTypeKey  contextKey = "helix_auth_principal_type"  // string ("user", "service")
+	AuthPrincipalRoleKey  contextKey = "helix_auth_principal_roles" // []string
+	AuthPrincipalEmailKey contextKey = "helix_auth_principal_email" // string
 )
 
-type AuthMiddlewareFactory struct {
-	verifier crypto.JWKSVerifier
+// --- The Strategy Interface (Inversion of Control) ---
+type AuthStrategy interface {
+	Authenticate(r *http.Request) (context.Context, error)
 }
 
-func NewAuthMiddlewareFactory(verifier crypto.JWKSVerifier) *AuthMiddlewareFactory {
-	if verifier == nil {
-		panic("AuthMiddlewareFactory requires a non-nil JWKSVerifier")
+// --- The Factory (Agnostic Middleware Generator) ---
+type AuthMiddleware struct {
+	strategy AuthStrategy
+}
+
+func NewAuthMiddleware(strategy AuthStrategy) *AuthMiddleware {
+	return &AuthMiddleware{
+		strategy: strategy,
 	}
-	return &AuthMiddlewareFactory{verifier: verifier}
 }
 
-// HTTPMiddleware enforces Bearer token verification on HTTP routes.
-func (f *AuthMiddlewareFactory) HTTPMiddleware(next http.Handler) http.Handler {
+// HTTPMiddleware: Standard interceptor
+func (m *AuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			// If optional auth is needed, logic changes. Here we enforce it.
-			// Or pass through and let handlers check context.
-			// Assuming strict enforcement for applied routes.
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		parts := strings.Split(authHeader, " ")
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			http.Error(w, "Invalid authorization header", http.StatusUnauthorized)
-			return
-		}
-
-		claims, err := f.verifier.VerifyToken(parts[1])
+		ctx, err := m.strategy.Authenticate(r)
 		if err != nil {
-			http.Error(w, "Invalid token: "+err.Error(), http.StatusUnauthorized)
+			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
-
-		ctx := r.Context()
-		ctx = context.WithValue(ctx, AuthPrincipalIDKey, claims.UserID)
-		ctx = context.WithValue(ctx, AuthPrincipalTypeKey, claims.Type)
-
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// GRPCUnaryInterceptor enforces Bearer token verification on gRPC calls.
-func (f *AuthMiddlewareFactory) GRPCUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+// GRPCUnaryInterceptor: Standard interceptor
+func (m *AuthMiddleware) GRPCUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	// Extract Metadata sebagai Headers
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return handler(ctx, req)
+		return nil, status.Error(codes.Unauthenticated, "metadata is not provided")
 	}
 
-	values := md["authorization"]
-	if len(values) == 0 {
-		return nil, status.Error(codes.Unauthenticated, "missing authorization header")
+	// Construct HTTP Request
+	mockReq := &http.Request{
+		Header: make(http.Header),
+		URL:    &url.URL{},
 	}
 
-	authHeader := values[0]
-	parts := strings.Split(authHeader, " ")
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		return nil, status.Error(codes.Unauthenticated, "invalid authorization header format")
+	// Map Metadata to Header (Normalize keys)
+	for k, v := range md {
+		for _, val := range v {
+			mockReq.Header.Add(k, val)
+		}
 	}
 
-	claims, err := f.verifier.VerifyToken(parts[1])
+	// Extract Peer IP (Untuk TrustedHeaderStrategy CIDR Check)
+	if p, ok := peer.FromContext(ctx); ok {
+		mockReq.RemoteAddr = p.Addr.String()
+	} else {
+		mockReq.RemoteAddr = "0.0.0.0:0" // Fallback
+	}
+
+	// Delegate to Strategy (Reusing Logic)
+	newCtx, err := m.strategy.Authenticate(mockReq)
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
 
-	ctx = context.WithValue(ctx, AuthPrincipalIDKey, claims.UserID)
-	ctx = context.WithValue(ctx, AuthPrincipalTypeKey, claims.Type)
+	return handler(newCtx, req)
+}
 
-	return handler(ctx, req)
+// Helper untuk gRPC Metadata extraction (Internal use - Legacy Support)
+func grpcExtractToken(ctx context.Context) (string, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return "", status.Error(codes.Unauthenticated, "metadata is not provided")
+	}
+	values := md["authorization"]
+	if len(values) == 0 {
+		return "", status.Error(codes.Unauthenticated, "authorization token is not provided")
+	}
+	authHeader := values[0]
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return "", status.Error(codes.Unauthenticated, "invalid auth header format")
+	}
+	return parts[1], nil
 }

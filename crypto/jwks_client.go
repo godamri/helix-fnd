@@ -20,13 +20,6 @@ type JWKSVerifier interface {
 	VerifyToken(tokenString string) (*HelixClaims, error)
 }
 
-type HelixClaims struct {
-	UserID string   `json:"sub"`
-	Roles  []string `json:"roles"`
-	Type   string   `json:"typ"`
-	jwt.RegisteredClaims
-}
-
 type jwks struct {
 	Keys []jsonWebKey `json:"keys"`
 }
