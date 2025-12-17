@@ -28,7 +28,7 @@ type AuthStrategy interface {
 	Authenticate(r *http.Request) (context.Context, error)
 }
 
-// --- The Factory (Agnostic Middleware Generator) ---
+// ---  The Factory (Agnostic Middleware Generator) ---
 type AuthMiddleware struct {
 	strategy AuthStrategy
 }
@@ -44,6 +44,7 @@ func (m *AuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, err := m.strategy.Authenticate(r)
 		if err != nil {
+			// Strategi menentukan detail error, Middleware hanya enforcing.
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
@@ -76,15 +77,17 @@ func (m *AuthMiddleware) GRPCUnaryInterceptor(ctx context.Context, req interface
 	if p, ok := peer.FromContext(ctx); ok {
 		mockReq.RemoteAddr = p.Addr.String()
 	} else {
-		mockReq.RemoteAddr = "0.0.0.0:0" // Fallback
+		mockReq.RemoteAddr = "0.0.0.0:0" // Fallback jika tidak ada peer info
 	}
 
-	// Delegate to Strategy (Reusing Logic)
+	// Delegate ke Strategy (Reusing Logic)
 	newCtx, err := m.strategy.Authenticate(mockReq)
 	if err != nil {
+		// Konversi error HTTP standar ke gRPC Status
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
 
+	// Lanjut ke Handler dengan Context baru (berisi Identity)
 	return handler(newCtx, req)
 }
 
