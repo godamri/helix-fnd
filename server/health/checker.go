@@ -3,89 +3,67 @@ package health
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
-	"sync"
 	"time"
 
 	"log/slog"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/go-chi/chi/v5"
 )
 
-// CachedHealthChecker prevents thundering herds by caching health status.
-// During a crash loop or massive scale-up, thousands of probes shouldn't DDoS the DB.
-type CachedHealthChecker struct {
-	db        *sql.DB
-	rdb       *redis.Client
-	mu        sync.RWMutex
-	healthy   bool
-	lastCheck time.Time
-	interval  time.Duration
+// Checker handles the health check endpoints.
+type Checker struct {
+	db     *sql.DB
+	logger *slog.Logger
 }
 
-func NewCachedHealthChecker(db *sql.DB, rdb *redis.Client) *CachedHealthChecker {
-	checker := &CachedHealthChecker{
-		db:       db,
-		rdb:      rdb,
-		interval: 5 * time.Second, // Only check DB once every 5 seconds
-		healthy:  true,            // Optimistic start
-	}
-	// Start background poller immediately
-	go checker.poll()
-	return checker
-}
-
-func (c *CachedHealthChecker) poll() {
-	ticker := time.NewTicker(c.interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		c.check()
+// NewChecker creates a new health checker instance.
+func NewChecker(db *sql.DB, logger *slog.Logger) *Checker {
+	return &Checker{
+		db:     db,
+		logger: logger,
 	}
 }
 
-func (c *CachedHealthChecker) check() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+// RegisterRoutes registers the health check routes on the router.
+func (c *Checker) RegisterRoutes(r chi.Router) {
+	r.Get("/health", c.HandleHealth)   // Liveness
+	r.Get("/ready", c.HandleReadiness) // Readiness
+}
+
+// HandleHealth provides a simple liveness check (Kubernetes Liveness Probe).
+// Just returns 200 OK if the binary is running.
+func (c *Checker) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+// HandleReadiness checks if the service is ready to accept traffic (Kubernetes Readiness Probe).
+// Performs a real-time check against the database.
+func (c *Checker) HandleReadiness(w http.ResponseWriter, r *http.Request) {
+	// If DB is slow (>200ms), we consider ourselves down to prevent traffic blackholes.
+	// We want the Load Balancer to cut us off immediately if DB is struggling.
+	ctx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
 	defer cancel()
 
-	dbErr := c.db.PingContext(ctx)
+	status := "UP"
+	statusCode := http.StatusOK
 
-	var redisErr error
-	if c.rdb != nil {
-		redisErr = c.rdb.Ping(ctx).Err()
+	if err := c.db.PingContext(ctx); err != nil {
+		c.logger.Error("readiness check failed: database unreachable or slow", "error", err)
+		status = "DOWN"
+		statusCode = http.StatusServiceUnavailable
 	}
 
-	isHealthy := dbErr == nil && redisErr == nil
-
-	if !isHealthy {
-		slog.Error("Health check failed", "db_error", dbErr, "redis_error", redisErr)
+	response := map[string]string{
+		"status": status,
+		"db":     status,
 	}
 
-	c.mu.Lock()
-	c.healthy = isHealthy
-	c.lastCheck = time.Now()
-	c.mu.Unlock()
-}
-
-// ReadinessHandler now reads from memory. 0ms latency.
-func (c *CachedHealthChecker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	c.mu.RLock()
-	healthy := c.healthy
-	c.mu.RUnlock()
-
-	if !healthy {
-		http.Error(w, "Service Unavailable (Cached Health)", http.StatusServiceUnavailable)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("READY"))
-}
-
-// LivenessHandler checks if the app process is running.
-func LivenessHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ALIVE"))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		c.logger.Error("failed to write health response", "error", err)
 	}
 }

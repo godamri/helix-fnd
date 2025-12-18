@@ -25,15 +25,13 @@ type IdempotencyConfig struct {
 	Logger      *slog.Logger
 }
 
-// StoredResponse adalah apa yang kita simpan di Redis.
-// Kita butuh Status Code, Header, dan Body untuk me-replay response.
+// StoredResponse is what we cache in Redis.
 type StoredResponse struct {
 	Status  int                 `json:"status"`
 	Headers map[string][]string `json:"headers"`
 	Body    []byte              `json:"body"`
 }
 
-// responseCapturer membajak ResponseWriter untuk menyalin output.
 type responseCapturer struct {
 	http.ResponseWriter
 	statusCode int
@@ -46,32 +44,38 @@ func (w *responseCapturer) WriteHeader(statusCode int) {
 }
 
 func (w *responseCapturer) Write(b []byte) (int, error) {
-	w.body.Write(b)                  // Salin ke buffer kita
-	return w.ResponseWriter.Write(b) // Tulis ke client asli
+	w.body.Write(b)
+	return w.ResponseWriter.Write(b)
 }
 
 func IdempotencyMiddleware(cfg IdempotencyConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip Safe Methods (GET, HEAD, OPTIONS) - Idempotency usually for mutations
+			// Skip Safe Methods
 			if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Get Key
 			key := r.Header.Get(cfg.HeaderKey)
 			if key == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			redisKey := fmt.Sprintf("idempotency:%s", key)
+			// We MUST use the authenticated user ID to prevent cross-tenant collisions.
+			principalID, ok := r.Context().Value(AuthPrincipalIDKey).(string)
+			if !ok || principalID == "" {
+				// If endpoint is public/unauthenticated, we fallback to IP, but prefix strictly.
+				// Ideally, critical transactional endpoints should ALWAYS be authenticated.
+				principalID = "anon_ip:" + r.RemoteAddr
+			}
+
+			// Format: idempotency:{user_id}:{client_key}
+			redisKey := fmt.Sprintf("idempotency:%s:%s", principalID, key)
 			ctx := r.Context()
 
-			// Check State
-			// Kita gunakan "SETNX" untuk mengklaim kunci.
-			// TTL pendek (30s) untuk lock pemrosesan (mencegah deadlock jika pod crash saat proses).
+			// Check State (SETNX for locking)
 			processingTTL := 30 * time.Second
 			acquired, err := cfg.RedisClient.SetNX(ctx, redisKey, "PROCESSING", processingTTL).Result()
 			if err != nil {
@@ -81,54 +85,40 @@ func IdempotencyMiddleware(cfg IdempotencyConfig) func(http.Handler) http.Handle
 			}
 
 			if !acquired {
-				// Kunci ada. Cek isinya.
 				val, err := cfg.RedisClient.Get(ctx, redisKey).Result()
 				if err != nil {
-					// Redis error atau key expired tepat saat kita cek
 					next.ServeHTTP(w, r)
 					return
 				}
 
 				if val == "PROCESSING" {
-					// Request SEDANG diproses oleh thread/pod lain.
-					// Di sini valid mengembalikan 409 Conflict atau 429 Too Many Requests
-					// untuk memberitahu klien "Sabar, lagi dikerjakan".
 					http.Error(w, "Request is currently being processed", http.StatusConflict)
 					return
 				}
 
-				// Jika bukan PROCESSING, asumsikan itu adalah JSON dari StoredResponse
 				var stored StoredResponse
 				if jsonErr := json.Unmarshal([]byte(val), &stored); jsonErr == nil {
-					// HIT! Kembalikan response yang tersimpan.
-					cfg.Logger.Info("Idempotency Hit", "key", key)
-
+					cfg.Logger.Info("Idempotency Hit", "key", key, "user", principalID)
 					for k, v := range stored.Headers {
 						for _, val := range v {
 							w.Header().Add(k, val)
 						}
 					}
-					// Tambahkan header penanda
 					w.Header().Set("X-Idempotency-Hit", "true")
 					w.WriteHeader(stored.Status)
 					w.Write(stored.Body)
 					return
 				}
 
-				// Jika data rusak/tidak valid, kita anggap miss dan proses ulang (Fail Open)
-				cfg.Logger.Warn("Idempotency cache corrupted, reprocessing", "key", key)
+				// Corrupted cache -> Fail open (reprocess)
+				cfg.Logger.Warn("Idempotency cache corrupted, reprocessing", "key", redisKey)
 			}
 
-			// Execute Handler & Capture Response
 			capturer := &responseCapturer{ResponseWriter: w, statusCode: http.StatusOK}
 			next.ServeHTTP(capturer, r)
 
-			// Simpan Response hanya jika sukses (2xx) atau sesuai kebutuhan bisnis.
-			// Biasanya kita simpan hasil final apapun (termasuk 400/500) agar konsisten.
-
-			// Jangan simpan jika status code 0 (koneksi putus/panic sebelum writeheader)
-			if capturer.statusCode == 0 {
-				// Hapus lock agar bisa di-retry
+			if capturer.statusCode == 0 || capturer.statusCode >= 500 {
+				// Don't cache internal server errors or crashes. Retry should be allowed.
 				cfg.RedisClient.Del(ctx, redisKey)
 				return
 			}
@@ -140,9 +130,6 @@ func IdempotencyMiddleware(cfg IdempotencyConfig) func(http.Handler) http.Handle
 			}
 
 			data, _ := json.Marshal(respToStore)
-
-			// Ganti status "PROCESSING" dengan data response sebenarnya
-			// Gunakan TTL penuh (misal 24 jam)
 			cfg.RedisClient.Set(ctx, redisKey, data, cfg.Expiry)
 		})
 	}

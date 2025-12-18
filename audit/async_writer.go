@@ -18,16 +18,12 @@ type AsyncLogger struct {
 	logger    *slog.Logger
 	closeOnce sync.Once
 
-	// Config
-	blockOnFull bool
-
-	// Drop Strategy Metrics
+	// Drop Strategy Stats
 	dropCount   uint64
-	lastLogTime time.Time
-	dropMu      sync.Mutex
+	lastLogTime atomic.Value // Stores time.Time
 }
 
-func NewAsyncLogger(w io.Writer, bufferSize int, blockOnFull bool, logger *slog.Logger) *AsyncLogger {
+func NewAsyncLogger(w io.Writer, bufferSize int, logger *slog.Logger) *AsyncLogger {
 	if w == nil {
 		w = os.Stdout
 	}
@@ -36,12 +32,11 @@ func NewAsyncLogger(w io.Writer, bufferSize int, blockOnFull bool, logger *slog.
 	}
 
 	l := &AsyncLogger{
-		events:      make(chan Event, bufferSize),
-		writer:      w,
-		logger:      logger,
-		blockOnFull: blockOnFull, // Injected Config
-		lastLogTime: time.Now(),
+		events: make(chan Event, bufferSize),
+		writer: w,
+		logger: logger,
 	}
+	l.lastLogTime.Store(time.Unix(0, 0))
 
 	l.wg.Add(1)
 	go l.worker()
@@ -49,52 +44,42 @@ func NewAsyncLogger(w io.Writer, bufferSize int, blockOnFull bool, logger *slog.
 	return l
 }
 
+// Log attempts to queue an event.
 func (l *AsyncLogger) Log(ctx context.Context, event Event) error {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
 	}
 
-	if l.blockOnFull {
-		// MODE: GUARANTEED DELIVERY
-		// Will block if buffer is full. Use with caution on high-throughput.
-		select {
-		case l.events <- event:
-			return nil
-		case <-ctx.Done():
-			// Even in blocking mode, respect context cancellation (timeout)
-			l.handleDrop(event.Action + "_ctx_cancelled")
-			return ctx.Err()
-		}
-	} else {
-		// STANDARD MODE: BEST EFFORT
-		select {
-		case l.events <- event:
-			return nil
-		default:
-			l.handleDrop(event.Action)
-			return nil
-		}
+	select {
+	case l.events <- event:
+		return nil
+	default:
+		// Buffer full. Drop log and increment counter for metrics.
+		l.handleDrop(event.Action)
+		return nil
 	}
 }
 
+// handleDrop performs rate-limited logging (1 log per 5 minutes) to prevent log flooding.
 func (l *AsyncLogger) handleDrop(action string) {
-	currentDrops := atomic.AddUint64(&l.dropCount, 1)
+	atomic.AddUint64(&l.dropCount, 1)
 
-	if time.Since(l.lastLogTime) < 5*time.Second {
-		return
+	now := time.Now()
+	lastLog, ok := l.lastLogTime.Load().(time.Time)
+	if !ok {
+		lastLog = time.Unix(0, 0)
 	}
 
-	l.dropMu.Lock()
-	defer l.dropMu.Unlock()
+	if now.Sub(lastLog) > 5*time.Minute {
+		l.lastLogTime.Store(now)
+		totalDropped := atomic.SwapUint64(&l.dropCount, 0)
 
-	if time.Since(l.lastLogTime) >= 5*time.Second {
-		l.logger.Warn("CRITICAL: Audit log buffer full/dropped.",
-			"strategy", "drop_on_full",
-			"total_dropped", currentDrops,
-			"sample_action", action,
+		l.logger.Warn("AUDIT_LOG_DROPPED",
+			slog.Uint64("dropped_count", totalDropped),
+			slog.String("reason", "buffer_full"),
+			slog.String("sample_action", action),
+			slog.String("strategy", "availability_first"),
 		)
-		atomic.StoreUint64(&l.dropCount, 0)
-		l.lastLogTime = time.Now()
 	}
 }
 
@@ -103,9 +88,8 @@ func (l *AsyncLogger) worker() {
 	encoder := json.NewEncoder(l.writer)
 
 	for event := range l.events {
-		// Retry logic for file writes could go here, but for stdout we just write.
 		if err := encoder.Encode(event); err != nil {
-			l.logger.Error("Failed to write audit log to IO", "error", err)
+			l.logger.Error("audit_write_failed", slog.String("err", err.Error()))
 		}
 	}
 }
