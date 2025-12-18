@@ -2,124 +2,147 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
-	"golang.org/x/sync/errgroup"
+	"github.com/go-chi/chi/v5"
 	"google.golang.org/grpc"
 )
 
 type Config struct {
-	// Feature Flags
-	EnableHTTP bool `envconfig:"ENABLE_HTTP" default:"true"`
-	EnableGRPC bool `envconfig:"ENABLE_GRPC" default:"false"`
+	EnableHTTP       bool
+	EnableGRPC       bool
+	HTTPPort         string
+	GRPCPort         string
+	HTTPReadTimeout  time.Duration
+	HTTPWriteTimeout time.Duration
+	ShutdownTimeout  time.Duration
 
-	// HTTP Config
-	HTTPPort         string        `envconfig:"HTTP_PORT" default:"8080"`
-	HTTPReadTimeout  time.Duration `envconfig:"HTTP_READ_TIMEOUT" default:"10s"`
-	HTTPWriteTimeout time.Duration `envconfig:"HTTP_WRITE_TIMEOUT" default:"10s"`
-
-	// gRPC Config
-	GRPCPort string `envconfig:"GRPC_PORT" default:"9090"`
-
-	// Common
-	ShutdownTimeout time.Duration `envconfig:"SHUTDOWN_TIMEOUT" default:"10s"`
+	// mTLS Configuration
+	MTLSEnabled    bool
+	MTLSCACert     string // Path to CA Certificate
+	MTLSServerCert string // Path to Server Certificate
+	MTLSServerKey  string // Path to Server Key
 }
 
 type Server struct {
-	cfg        Config
-	log        *slog.Logger
-	httpServer *http.Server
-	grpcServer *grpc.Server
+	cfg     Config
+	logger  *slog.Logger
+	router  *chi.Mux
+	grpcSrv *grpc.Server
+	httpSrv *http.Server
 }
 
-// New initializes the server wrapper.
-// Pass nil for grpcServer if EnableGRPC is false, or pass a configured *grpc.Server.
-func New(cfg Config, logger *slog.Logger, httpHandler http.Handler, grpcServer *grpc.Server) *Server {
-	s := &Server{
-		cfg: cfg,
-		log: logger,
+func New(cfg Config, logger *slog.Logger, router *chi.Mux, grpcSrv *grpc.Server) *Server {
+	return &Server{
+		cfg:     cfg,
+		logger:  logger,
+		router:  router,
+		grpcSrv: grpcSrv,
 	}
-
-	if cfg.EnableHTTP {
-		s.httpServer = &http.Server{
-			Addr:         ":" + cfg.HTTPPort,
-			Handler:      httpHandler,
-			ReadTimeout:  cfg.HTTPReadTimeout,
-			WriteTimeout: cfg.HTTPWriteTimeout,
-		}
-	}
-
-	if cfg.EnableGRPC {
-		if grpcServer == nil {
-			// Fallback: Create a default one if none provided but enabled
-			// Ideally, the caller should register services before passing it here.
-			s.grpcServer = grpc.NewServer()
-		} else {
-			s.grpcServer = grpcServer
-		}
-	}
-
-	return s
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	g, ctx := errgroup.WithContext(ctx)
+	errChan := make(chan error, 2)
 
-	// 1. Start HTTP
-	if s.cfg.EnableHTTP && s.httpServer != nil {
-		g.Go(func() error {
-			s.log.Info("Starting HTTP server", "port", s.cfg.HTTPPort)
-			if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				return fmt.Errorf("http server failed: %w", err)
-			}
-			return nil
-		})
-	}
+	// Start HTTP Server
+	if s.cfg.EnableHTTP {
+		s.httpSrv = &http.Server{
+			Addr:         ":" + s.cfg.HTTPPort,
+			Handler:      s.router,
+			ReadTimeout:  s.cfg.HTTPReadTimeout,
+			WriteTimeout: s.cfg.HTTPWriteTimeout,
+		}
 
-	// 2. Start gRPC
-	if s.cfg.EnableGRPC && s.grpcServer != nil {
-		g.Go(func() error {
-			lis, err := net.Listen("tcp", ":"+s.cfg.GRPCPort)
+		if s.cfg.MTLSEnabled {
+			s.logger.Info("Enabling mTLS for HTTP Server")
+			tlsConfig, err := loadMTLSConfig(s.cfg.MTLSCACert)
 			if err != nil {
-				return fmt.Errorf("failed to listen for grpc: %w", err)
+				return fmt.Errorf("failed to load mTLS config: %w", err)
 			}
-			s.log.Info("Starting gRPC server", "port", s.cfg.GRPCPort)
-			if err := s.grpcServer.Serve(lis); err != nil {
-				return fmt.Errorf("grpc server failed: %w", err)
+			s.httpSrv.TLSConfig = tlsConfig
+		}
+
+		go func() {
+			s.logger.Info("HTTP server starting", "port", s.cfg.HTTPPort, "mtls", s.cfg.MTLSEnabled)
+			var err error
+			if s.cfg.MTLSEnabled {
+				err = s.httpSrv.ListenAndServeTLS(s.cfg.MTLSServerCert, s.cfg.MTLSServerKey)
+			} else {
+				err = s.httpSrv.ListenAndServe()
 			}
-			return nil
-		})
+			if err != nil && err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("http server failed: %w", err)
+			}
+		}()
 	}
 
-	// 3. Wait for Shutdown Signal
-	g.Go(func() error {
-		<-ctx.Done()
-		s.log.Info("Shutdown signal received")
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
-		defer cancel()
-
-		var shutdownErr error
-
-		if s.httpServer != nil {
-			s.log.Info("Shutting down HTTP server...")
-			if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
-				s.log.Error("HTTP shutdown error", "error", err)
-				shutdownErr = err
+	// Start gRPC Server
+	if s.cfg.EnableGRPC {
+		go func() {
+			s.logger.Info("gRPC server starting", "port", s.cfg.GRPCPort)
+			lis, err := SystemSocket(s.cfg.GRPCPort)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to listen grpc: %w", err)
+				return
 			}
+			if err := s.grpcSrv.Serve(lis); err != nil {
+				errChan <- fmt.Errorf("grpc server failed: %w", err)
+			}
+		}()
+	}
+
+	// Wait for Shutdown
+	select {
+	case <-ctx.Done():
+		s.logger.Info("Shutting down servers...")
+		return s.shutdown()
+	case err := <-errChan:
+		return err
+	}
+}
+
+func (s *Server) shutdown() error {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
+	defer cancel()
+
+	if s.httpSrv != nil {
+		if err := s.httpSrv.Shutdown(shutdownCtx); err != nil {
+			s.logger.Error("HTTP shutdown error", "error", err)
 		}
+	}
 
-		if s.grpcServer != nil {
-			s.log.Info("Shutting down gRPC server...")
-			s.grpcServer.GracefulStop()
-		}
+	if s.grpcSrv != nil {
+		s.grpcSrv.GracefulStop()
+	}
 
-		return shutdownErr
-	})
+	return nil
+}
 
-	return g.Wait()
+func loadMTLSConfig(caPath string) (*tls.Config, error) {
+	caCert, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("could not read CA cert: %w", err)
+	}
+
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to append CA cert")
+	}
+
+	return &tls.Config{
+		ClientCAs:  caCertPool,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		MinVersion: tls.VersionTLS12,
+	}, nil
+}
+
+func SystemSocket(port string) (net.Listener, error) {
+	return net.Listen("tcp", ":"+port)
 }
