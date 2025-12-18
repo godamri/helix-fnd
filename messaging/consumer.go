@@ -31,6 +31,9 @@ func NewConsumer(cfg Config, groupID string, topics []string, handlerFn EventHan
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 	config.Version = sarama.V2_8_0_0
 
+	// FIX: Return error to session to trigger rebalance/backoff instead of silent skip
+	config.Consumer.Return.Errors = true
+
 	client, err := sarama.NewConsumerGroup(cfg.Brokers, groupID, config)
 	if err != nil {
 		return nil, fmt.Errorf("kafka: failed to start consumer group: %w", err)
@@ -55,13 +58,20 @@ func (c *Consumer) Start(ctx context.Context) error {
 	c.logger.Info("Starting Kafka consumer...", "topics", c.topics)
 
 	for {
-		// Consume is blocking. It returns when rebalance happens or context cancelled.
+		// Consume is blocking. It returns when rebalance happens, context cancelled, or error occurs.
 		if err := c.client.Consume(ctx, c.topics, c.handler); err != nil {
 			if err == sarama.ErrClosedConsumerGroup {
 				return nil
 			}
-			c.logger.Error("Error from consumer", "error", err)
-			time.Sleep(1 * time.Second) // Backoff before reconnect
+			c.logger.Error("Consumer session terminated with error", "error", err)
+
+			// Simple backoff to prevent tight loops on persistent failures
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+				continue
+			}
 		}
 
 		if ctx.Err() != nil {
@@ -104,7 +114,7 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 			trace.WithAttributes(
 				attribute.String("messaging.system", "kafka"),
 				attribute.String("messaging.destination", msg.Topic),
-				attribute.String("messaging.kafka.consumer_group", "helix-consumer"), // Should be parametrized
+				attribute.String("messaging.kafka.consumer_group", "helix-consumer"),
 			),
 			trace.WithSpanKind(trace.SpanKindConsumer),
 		)
@@ -114,13 +124,17 @@ func (h *consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 		// Execute Handler
 		err := h.handlerFn(ctx, msg.Value, headers)
 		if err != nil {
-			h.logger.ErrorContext(ctx, "Handler failed", "error", err)
+			h.logger.ErrorContext(ctx, "Handler failed (Not Committing)", "error", err, "topic", msg.Topic, "offset", msg.Offset)
 			span.RecordError(err)
-			// Decide: Do we mark offset? For now, YES (At-least-once with manual DLQ logic inside handler preferred).
-			// If we don't mark, we get stuck on poison pill.
+			span.End()
+
+			// Return error to Sarama.
+			// This causes the ConsumeClaim to exit, the session to end, and the offset remains UNCOMMITTED.
+			// The Consumer loop in Start() will restart and re-consume this message (At-Least-Once).
+			return err
 		}
 
-		// Mark Message
+		// Mark Message only on success
 		session.MarkMessage(msg, "")
 		span.End()
 	}

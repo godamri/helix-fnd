@@ -8,12 +8,9 @@ import (
 
 	"github.com/uptrace/opentelemetry-go-extra/otelsql"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
-
-	_ "github.com/jackc/pgx/v5/stdlib" // Explicitly register pgx driver
 )
 
 // Config holds standard database configuration.
-// It is the service's responsibility to load these values.
 type Config struct {
 	DSN             string        `envconfig:"DB_DSN" required:"true"`
 	MaxOpenConns    int           `envconfig:"DB_MAX_OPEN_CONNS" default:"25"`
@@ -22,11 +19,11 @@ type Config struct {
 }
 
 // NewPostgres initializes a *sql.DB with OpenTelemetry instrumentation and connection pooling.
-// It returns a standard *sql.DB compatible with any stdlib pattern (including Ent).
-func NewPostgres(ctx context.Context, cfg Config, serviceName string) (*sql.DB, error) {
-	// 1. Wrap the driver with OTel instrumentation
-	// This ensures every SQL query automatically emits a tracing span.
-	db, err := otelsql.Open("pgx", cfg.DSN,
+// NOTE: The caller MUST register the driver (e.g. _ "github.com/jackc/pgx/v5/stdlib")
+// and pass the driverName (e.g. "pgx") explicitly.
+func NewPostgres(ctx context.Context, cfg Config, driverName string, serviceName string) (*sql.DB, error) {
+	// Wrap the driver with OTel instrumentation
+	db, err := otelsql.Open(driverName, cfg.DSN,
 		otelsql.WithAttributes(semconv.ServiceNameKey.String(serviceName)),
 		otelsql.WithDBName("postgres"),
 	)
@@ -34,13 +31,12 @@ func NewPostgres(ctx context.Context, cfg Config, serviceName string) (*sql.DB, 
 		return nil, fmt.Errorf("helix-fnd/database: failed to open connection: %w", err)
 	}
 
-	// 2. Configure Connection Pooling (Critical for production stability)
+	// Configure Connection Pooling
 	db.SetMaxOpenConns(cfg.MaxOpenConns)
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 
-	// 3. Verify Connectivity with Timeout
-	// Fail fast if the DB is unreachable during startup.
+	// Verify Connectivity with Timeout
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 

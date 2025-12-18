@@ -3,19 +3,44 @@ package log
 import (
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/lmittmann/tint"
 )
 
 type Config struct {
-	Level  string `envconfig:"LOG_LEVEL" default:"info"`  // debug, info, warn, error
-	Format string `envconfig:"LOG_FORMAT" default:"json"` // json, console
+	Level  string `envconfig:"LOG_LEVEL" default:"info"`
+	Format string `envconfig:"LOG_FORMAT" default:"json"`
+}
+
+// sensitiveKeys defines fields that must be redacted.
+var sensitiveKeys = map[string]bool{
+	"password":      true,
+	"token":         true,
+	"access_token":  true,
+	"refresh_token": true,
+	"authorization": true,
+	"secret":        true,
+	"db_dsn":        true,
+	"api_key":       true,
+}
+
+// Redactor filters sensitive keys from log output.
+func Redactor(groups []string, a slog.Attr) slog.Attr {
+	key := strings.ToLower(a.Key)
+	if sensitiveKeys[key] {
+		return slog.Attr{
+			Key:   a.Key,
+			Value: slog.StringValue("[REDACTED]"),
+		}
+	}
+	return a
 }
 
 func New(cfg Config) *slog.Logger {
 	var level slog.Level
-	switch cfg.Level {
+	switch strings.ToLower(cfg.Level) {
 	case "debug":
 		level = slog.LevelDebug
 	case "warn":
@@ -29,15 +54,15 @@ func New(cfg Config) *slog.Logger {
 	var handler slog.Handler
 
 	if cfg.Format == "console" {
-		// Pretty Print for Local Development
 		handler = tint.NewHandler(os.Stdout, &tint.Options{
-			Level:      level,
-			TimeFormat: time.TimeOnly,
+			Level:       level,
+			TimeFormat:  time.TimeOnly,
+			ReplaceAttr: Redactor,
 		})
 	} else {
-		// JSON for Production (Machine Readable)
 		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: level,
+			Level:       level,
+			ReplaceAttr: Redactor,
 		})
 	}
 

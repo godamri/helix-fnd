@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -14,38 +15,56 @@ import (
 )
 
 // AuditMiddleware records business events for non-GET requests.
-// It captures Actor (from Context), Action (Method + Path), and Status.
-func AuditMiddleware(logger audit.Logger) func(http.Handler) http.Handler {
+// It captures Actor, Action, Resource, Status, and Payload (capped).
+func AuditMiddleware(logger audit.Logger, cfg audit.Config) func(http.Handler) http.Handler {
+	// Pre-process exclude paths for O(1) lookup map if list is long,
+	// but slice iteration is fine for short lists.
+	skipPaths := make(map[string]bool)
+	for _, p := range cfg.ExcludePaths {
+		skipPaths[strings.TrimSpace(p)] = true
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Skip GET/OPTIONS (Read-only usually not audited in high-throughput, optional)
 			if r.Method == http.MethodGet || r.Method == http.MethodOptions {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Skip Excluded Paths
+			if skipPaths[r.URL.Path] {
 				next.ServeHTTP(w, r)
 				return
 			}
 
 			start := time.Now()
 
-			// For Enterprise, we might want to limit this or skip sensitive paths.
-			// Here is a simple implementation that reads and restores body.
+			// Body Capture with Configurable Limit
 			var reqBody []byte
-			if r.Body != nil {
-				reqBody, _ = io.ReadAll(r.Body)
-				r.Body = io.NopCloser(bytes.NewBuffer(reqBody))
+			if r.Body != nil && cfg.MaxBodySize > 0 {
+				// Use the configured limit
+				limitReader := io.LimitReader(r.Body, cfg.MaxBodySize)
+				reqBody, _ = io.ReadAll(limitReader)
+
+				// Restore body so the handler can read it.
+				// We reconstruct the body using the bytes we read + the rest of the stream.
+				r.Body = io.NopCloser(io.MultiReader(bytes.NewBuffer(reqBody), r.Body))
 			}
 
 			ww := chiMiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
 
 			next.ServeHTTP(ww, r)
 
-			// Assumption: UserID is injected into context by Auth Middleware
+			// Async Log
 			actorID := "anonymous"
-			if u, ok := r.Context().Value("user_id").(string); ok {
+			if u, ok := r.Context().Value(AuthPrincipalIDKey).(string); ok {
 				actorID = u
 			}
 
 			path := r.URL.Path
 			if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePattern() != "" {
-				path = rctx.RoutePattern() // Use pattern "/users/{id}" instead of raw path
+				path = rctx.RoutePattern()
 			}
 
 			event := audit.Event{
@@ -59,12 +78,10 @@ func AuditMiddleware(logger audit.Logger) func(http.Handler) http.Handler {
 					"ip":         r.RemoteAddr,
 					"user_agent": r.UserAgent(),
 				},
-				// Note: OldValue/NewValue usually requires Application Layer logic.
-				// Middleware can only capture "Payload" (NewValue candidate).
 				NewValue: string(reqBody),
 			}
 
-			// Use background context because request context is cancelled after handler returns
+			// Use background context to prevent cancellation
 			_ = logger.Log(context.Background(), event)
 		})
 	}

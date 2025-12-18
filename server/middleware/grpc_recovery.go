@@ -16,17 +16,17 @@ import (
 func GRPCRecoveryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			// 1. Capture Stack
+			// Capture Stack
 			stack := string(debug.Stack())
 
-			// 2. Log with Context
+			// Log with Context
 			slog.ErrorContext(ctx, "GRPC PANIC RECOVERED",
 				"error", fmt.Sprintf("%v", rec),
 				"method", info.FullMethod,
 				"stack", stack,
 			)
 
-			// 3. Return Internal Error to client
+			// Return Internal Error to client
 			err = status.Errorf(codes.Internal, "internal server error")
 		}
 	}()

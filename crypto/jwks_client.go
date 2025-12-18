@@ -14,7 +14,13 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/sync/singleflight"
 )
+
+// AUDIT FIX: Hard limit on stale keys.
+// If we haven't refreshed keys in 24 hours, assume we are partitioned or under attack.
+// Stop accepting tokens.
+const MaxKeyStaleDuration = 24 * time.Hour
 
 type JWKSVerifier interface {
 	VerifyToken(tokenString string) (*HelixClaims, error)
@@ -33,12 +39,14 @@ type jsonWebKey struct {
 }
 
 type CachingClient struct {
-	jwksURL string
-	issuer  string
-	cache   map[string]*rsa.PublicKey
-	mu      sync.RWMutex
-	log     *slog.Logger
-	client  *http.Client
+	jwksURL     string
+	issuer      string
+	cache       map[string]*rsa.PublicKey
+	lastUpdated time.Time // AUDIT FIX: Track age of cache
+	mu          sync.RWMutex
+	log         *slog.Logger
+	client      *http.Client
+	sf          singleflight.Group
 }
 
 func NewJWKSCachingClient(jwksURL string, issuer string, refreshInterval time.Duration, logger *slog.Logger) (JWKSVerifier, error) {
@@ -56,7 +64,8 @@ func NewJWKSCachingClient(jwksURL string, issuer string, refreshInterval time.Du
 		},
 	}
 
-	if err := c.refreshKeys(context.Background()); err != nil {
+	// Initial fetch
+	if err := c.fetchKeys(context.Background()); err != nil {
 		return nil, fmt.Errorf("jwks client: FATAL on initial key fetch: %w", err)
 	}
 
@@ -78,8 +87,13 @@ func (c *CachingClient) startKeyRefresher(ctx context.Context, interval time.Dur
 			return
 		case <-ticker.C:
 			refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := c.refreshKeys(refreshCtx); err != nil {
-				c.log.Error("Failed to refresh JWKS keys (Soft Failure, using old keys)", "error", err)
+			if err := c.doRefresh(refreshCtx); err != nil {
+				// AUDIT FIX: Alert if we are approaching the stale limit
+				timeSinceUpdate := time.Since(c.lastUpdated)
+				c.log.Error("Failed to refresh JWKS keys",
+					"error", err,
+					"cache_age", timeSinceUpdate.String(),
+				)
 			} else {
 				c.log.Debug("JWKS keys refreshed successfully")
 			}
@@ -88,7 +102,14 @@ func (c *CachingClient) startKeyRefresher(ctx context.Context, interval time.Dur
 	}
 }
 
-func (c *CachingClient) refreshKeys(ctx context.Context) error {
+func (c *CachingClient) doRefresh(ctx context.Context) error {
+	_, err, _ := c.sf.Do("refresh_keys", func() (interface{}, error) {
+		return nil, c.fetchKeys(ctx)
+	})
+	return err
+}
+
+func (c *CachingClient) fetchKeys(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.jwksURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -112,18 +133,14 @@ func (c *CachingClient) refreshKeys(ctx context.Context) error {
 	newCache := make(map[string]*rsa.PublicKey)
 	for _, jwk := range newJwks.Keys {
 		if jwk.Kty != "RSA" || jwk.Use != "sig" {
-			c.log.Warn("Skipping non-RSA or non-signature key", "kid", jwk.Kid)
 			continue
 		}
-
 		if jwk.Kid == "" {
-			c.log.Warn("Skipping JWK without Key ID (KID)")
 			continue
 		}
-
 		key, err := jwk.toRSAPublicKey()
 		if err != nil {
-			c.log.Error("Failed to convert JWK to RSA key", "kid", jwk.Kid, "error", err)
+			c.log.Warn("Failed to convert JWK", "kid", jwk.Kid, "error", err)
 			continue
 		}
 		newCache[jwk.Kid] = key
@@ -135,6 +152,7 @@ func (c *CachingClient) refreshKeys(ctx context.Context) error {
 
 	c.mu.Lock()
 	c.cache = newCache
+	c.lastUpdated = time.Now() // AUDIT FIX: Update timestamp
 	c.mu.Unlock()
 
 	return nil
@@ -165,20 +183,29 @@ func (j *jsonWebKey) toRSAPublicKey() (*rsa.PublicKey, error) {
 		return nil, errors.New("invalid exponent (e): value is zero")
 	}
 
-	key := &rsa.PublicKey{
-		N: n,
-		E: eVal,
-	}
-
-	return key, nil
+	return &rsa.PublicKey{N: n, E: eVal}, nil
 }
 
 var (
 	ErrInvalidToken = errors.New("crypto: invalid token")
 	ErrExpiredToken = errors.New("crypto: token expired")
+	ErrStaleKeys    = errors.New("crypto: keys are stale and untrusted")
 )
 
 func (c *CachingClient) VerifyToken(tokenString string) (*HelixClaims, error) {
+	// AUDIT FIX: Stale Cache Protection
+	c.mu.RLock()
+	cacheAge := time.Since(c.lastUpdated)
+	c.mu.RUnlock()
+
+	if cacheAge > MaxKeyStaleDuration {
+		c.log.Error("Rejecting token verification due to stale keys", "age", cacheAge.String())
+		// Try one last desperate synchronous refresh
+		if err := c.doRefresh(context.Background()); err != nil {
+			return nil, ErrStaleKeys
+		}
+	}
+
 	token, _ := jwt.Parse(tokenString, nil)
 	if token == nil {
 		return nil, ErrInvalidToken
@@ -193,10 +220,9 @@ func (c *CachingClient) VerifyToken(tokenString string) (*HelixClaims, error) {
 	c.mu.RUnlock()
 
 	if !found {
-		c.log.Warn("Key ID not found in cache. Attempting immediate refresh...", "kid", kid)
-		// Try forced refresh
-		if err := c.refreshKeys(context.Background()); err != nil {
-			c.log.Error("Failed immediate key refresh. Rejecting token.", "error", err)
+		c.log.Warn("Key ID not found in cache. Triggering singleflight refresh...", "kid", kid)
+		if err := c.doRefresh(context.Background()); err != nil {
+			c.log.Error("Failed key refresh. Rejecting token.", "error", err)
 			return nil, ErrInvalidToken
 		}
 
@@ -205,7 +231,6 @@ func (c *CachingClient) VerifyToken(tokenString string) (*HelixClaims, error) {
 		c.mu.RUnlock()
 
 		if !found {
-			c.log.Warn("Key ID still not found after refresh. Rejecting token.", "kid", kid)
 			return nil, ErrInvalidToken
 		}
 	}

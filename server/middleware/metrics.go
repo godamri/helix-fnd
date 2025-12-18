@@ -42,11 +42,15 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start).Seconds()
 		status := strconv.Itoa(ww.Status())
 
-		// Use chi's RouteContext to get the pattern (e.g. "/users/{id}") instead of raw path "/users/123"
-		// to prevent cardinality explosion in Prometheus.
-		path := r.URL.Path
+		// Cardinality Explosion Protection
+		// Default to "unmatched_route" to catch 404s, 405s, or weird paths.
+		// Never use r.URL.Path directly as a label value.
+		path := "unmatched_route"
+
 		if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePattern() != "" {
 			path = rctx.RoutePattern()
+		} else if ww.Status() == http.StatusNotFound {
+			path = "not_found"
 		}
 
 		httpRequestsTotal.WithLabelValues(status, r.Method, path).Inc()

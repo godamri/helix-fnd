@@ -2,22 +2,16 @@ package middleware
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 // luaGCRA implements Generic Cell Rate Algorithm.
-// A sophisticated leaky bucket variation.
-// KEYS[1] = rate_limit_key
-// ARGV[1] = rate (requests per period)
-// ARGV[2] = period (seconds)
-// ARGV[3] = burst (max concurrent)
-// Returns:
-// >= 0: Limited. Value is retry_after (seconds).
-// -1: Allowed.
 var luaGCRA = redis.NewScript(`
 	local key = KEYS[1]
 	local rate = tonumber(ARGV[1])
@@ -55,12 +49,21 @@ var luaGCRA = redis.NewScript(`
 func RateLimitMiddleware(rdb *redis.Client, rate int, period time.Duration, burst int) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Identification Strategy:
-			// 1. User ID (if Authenticated)
-			// 2. IP Address (Fallback)
-			identity := r.RemoteAddr
-			if user := r.Context().Value("user_id"); user != nil {
+			// IP Resolution Risk
+			// Previously: r.RemoteAddr (Internal K8s IP).
+			// Now: Prioritize UserID -> X-Forwarded-For -> RemoteAddr.
+
+			var identity string
+
+			// 1. Identity based on Auth (Most Secure/Accurate)
+			if user := r.Context().Value(AuthPrincipalIDKey); user != nil {
 				identity = fmt.Sprintf("user:%v", user)
+			} else {
+				// Fallback to IP
+				// WARNING: This assumes your Load Balancer/Ingress strips untrusted X-Forwarded-For headers
+				// and appends the real one. If exposed directly to internet, this is spoofable.
+				clientIP := getRealIP(r)
+				identity = "ip:" + clientIP
 			}
 
 			key := fmt.Sprintf("rl:%s", identity)
@@ -68,8 +71,7 @@ func RateLimitMiddleware(rdb *redis.Client, rate int, period time.Duration, burs
 			// Execute GCRA
 			res, err := luaGCRA.Run(r.Context(), rdb, []string{key}, rate, period.Seconds(), burst).Float64()
 			if err != nil {
-				// Fail Open: If Redis is down, don't block users. Log it!
-				// slog.Error("Rate limit error", "err", err)
+				// Fail Open: Redis down? Let traffic pass.
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -86,4 +88,31 @@ func RateLimitMiddleware(rdb *redis.Client, rate int, period time.Duration, burs
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// getRealIP attempts to extract the true client IP from headers.
+// It supports standard X-Forwarded-For and X-Real-Ip.
+func getRealIP(r *http.Request) string {
+	// Standard Proxy Header
+	xForwardedFor := r.Header.Get("X-Forwarded-For")
+	if xForwardedFor != "" {
+		// X-Forwarded-For: client, proxy1, proxy2
+		// We take the first one (Client IP).
+		// NOTE: In a trusted internal network/Ingress, this is safe.
+		parts := strings.Split(xForwardedFor, ",")
+		return strings.TrimSpace(parts[0])
+	}
+
+	// Nginx/Envoy often set this single header
+	xRealIP := r.Header.Get("X-Real-Ip")
+	if xRealIP != "" {
+		return xRealIP
+	}
+
+	// Fallback to direct connection (Localhost / Dev / No Proxy)
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }

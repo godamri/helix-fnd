@@ -2,11 +2,8 @@ package middleware
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -17,8 +14,7 @@ import (
 type IdempotencyMode string
 
 const (
-	ModeHeaderOnly IdempotencyMode = "HEADER_ONLY" // Key: idempotency:{token}
-	ModeBodyHash   IdempotencyMode = "BODY_HASH"   // Key: idempotency:{token}:{body_hash}
+	ModeHeaderOnly IdempotencyMode = "HEADER_ONLY"
 )
 
 type IdempotencyConfig struct {
@@ -29,42 +25,55 @@ type IdempotencyConfig struct {
 	Logger      *slog.Logger
 }
 
+// StoredResponse adalah apa yang kita simpan di Redis.
+// Kita butuh Status Code, Header, dan Body untuk me-replay response.
+type StoredResponse struct {
+	Status  int                 `json:"status"`
+	Headers map[string][]string `json:"headers"`
+	Body    []byte              `json:"body"`
+}
+
+// responseCapturer membajak ResponseWriter untuk menyalin output.
+type responseCapturer struct {
+	http.ResponseWriter
+	statusCode int
+	body       bytes.Buffer
+}
+
+func (w *responseCapturer) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *responseCapturer) Write(b []byte) (int, error) {
+	w.body.Write(b)                  // Salin ke buffer kita
+	return w.ResponseWriter.Write(b) // Tulis ke client asli
+}
+
 func IdempotencyMiddleware(cfg IdempotencyConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip if safe method (GET, HEAD, OPTIONS)
+			// Skip Safe Methods (GET, HEAD, OPTIONS) - Idempotency usually for mutations
 			if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Get Idempotency Key
+			// Get Key
 			key := r.Header.Get(cfg.HeaderKey)
 			if key == "" {
-				// If required, reject. For now, we allow pass-through if missing (optional idempotency).
-				// Strict mode can be added later.
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Determine Redis Key based on Mode
-			var redisKey string
-			switch cfg.Mode {
-			case ModeBodyHash:
-				hash, err := generateBodyHash(r)
-				if err != nil {
-					cfg.Logger.Error("idempotency: failed to hash body", "error", err)
-					http.Error(w, "Invalid Request Body", http.StatusBadRequest)
-					return
-				}
-				redisKey = fmt.Sprintf("idempotency:%s:%s", key, hash)
-			default:
-				redisKey = fmt.Sprintf("idempotency:%s", key)
-			}
+			redisKey := fmt.Sprintf("idempotency:%s", key)
+			ctx := r.Context()
 
-			// Check Redis (SETNX - Set if Not Exists)
-			// We store "PROCESSING" status first to handle concurrent race conditions.
-			acquired, err := cfg.RedisClient.SetNX(r.Context(), redisKey, "PROCESSING", cfg.Expiry).Result()
+			// Check State
+			// Kita gunakan "SETNX" untuk mengklaim kunci.
+			// TTL pendek (30s) untuk lock pemrosesan (mencegah deadlock jika pod crash saat proses).
+			processingTTL := 30 * time.Second
+			acquired, err := cfg.RedisClient.SetNX(ctx, redisKey, "PROCESSING", processingTTL).Result()
 			if err != nil {
 				cfg.Logger.Error("idempotency: redis error", "error", err)
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -72,57 +81,69 @@ func IdempotencyMiddleware(cfg IdempotencyConfig) func(http.Handler) http.Handle
 			}
 
 			if !acquired {
-				// Key exists. Check if it's still processing or done.
-				val, _ := cfg.RedisClient.Get(r.Context(), redisKey).Result()
-				if val == "PROCESSING" {
-					http.Error(w, "Request already in progress", http.StatusConflict)
+				// Kunci ada. Cek isinya.
+				val, err := cfg.RedisClient.Get(ctx, redisKey).Result()
+				if err != nil {
+					// Redis error atau key expired tepat saat kita cek
+					next.ServeHTTP(w, r)
 					return
 				}
-				// If we had stored the response, we could return it here.
-				// For now, simple idempotency rejection:
-				http.Error(w, "Request already processed", http.StatusConflict)
+
+				if val == "PROCESSING" {
+					// Request SEDANG diproses oleh thread/pod lain.
+					// Di sini valid mengembalikan 409 Conflict atau 429 Too Many Requests
+					// untuk memberitahu klien "Sabar, lagi dikerjakan".
+					http.Error(w, "Request is currently being processed", http.StatusConflict)
+					return
+				}
+
+				// Jika bukan PROCESSING, asumsikan itu adalah JSON dari StoredResponse
+				var stored StoredResponse
+				if jsonErr := json.Unmarshal([]byte(val), &stored); jsonErr == nil {
+					// HIT! Kembalikan response yang tersimpan.
+					cfg.Logger.Info("Idempotency Hit", "key", key)
+
+					for k, v := range stored.Headers {
+						for _, val := range v {
+							w.Header().Add(k, val)
+						}
+					}
+					// Tambahkan header penanda
+					w.Header().Set("X-Idempotency-Hit", "true")
+					w.WriteHeader(stored.Status)
+					w.Write(stored.Body)
+					return
+				}
+
+				// Jika data rusak/tidak valid, kita anggap miss dan proses ulang (Fail Open)
+				cfg.Logger.Warn("Idempotency cache corrupted, reprocessing", "key", key)
+			}
+
+			// Execute Handler & Capture Response
+			capturer := &responseCapturer{ResponseWriter: w, statusCode: http.StatusOK}
+			next.ServeHTTP(capturer, r)
+
+			// Simpan Response hanya jika sukses (2xx) atau sesuai kebutuhan bisnis.
+			// Biasanya kita simpan hasil final apapun (termasuk 400/500) agar konsisten.
+
+			// Jangan simpan jika status code 0 (koneksi putus/panic sebelum writeheader)
+			if capturer.statusCode == 0 {
+				// Hapus lock agar bisa di-retry
+				cfg.RedisClient.Del(ctx, redisKey)
 				return
 			}
 
-			// Execute Handler
-			// Capture response writer to store result later if needed (Phase 3 enhancement).
-			// For now, we just proceed.
-			next.ServeHTTP(w, r)
+			respToStore := StoredResponse{
+				Status:  capturer.statusCode,
+				Headers: capturer.Header(),
+				Body:    capturer.body.Bytes(),
+			}
 
-			// Update status (Optional: Store response)
-			// In a full implementation, you'd wrap ResponseWriter, capture status/body, and store it in Redis.
-			// Here we keep the lock 'true' to prevent replays.
-			cfg.RedisClient.Set(r.Context(), redisKey, "COMPLETED", cfg.Expiry)
+			data, _ := json.Marshal(respToStore)
+
+			// Ganti status "PROCESSING" dengan data response sebenarnya
+			// Gunakan TTL penuh (misal 24 jam)
+			cfg.RedisClient.Set(ctx, redisKey, data, cfg.Expiry)
 		})
 	}
-}
-
-// generateBodyHash creates a SHA256 hash of the canonicalized JSON body.
-// It reads r.Body and restores it for the next handler.
-func generateBodyHash(r *http.Request) (string, error) {
-	if r.Body == nil {
-		return "", nil
-	}
-
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		return "", err
-	}
-	// Restore body
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	if len(bodyBytes) == 0 {
-		return "empty", nil
-	}
-
-	// Canonicalization: Unmarshal to interface{} and Marshal back.
-	// encoding/json sorts map keys, providing basic canonicalization.
-	var body interface{}
-	if err := json.Unmarshal(bodyBytes, &body); err != nil {
-		return "", err // Not valid JSON, maybe return raw hash or error
-	}
-
-	canonicalBytes, _ := json.Marshal(body)
-	hash := sha256.Sum256(canonicalBytes)
-	return hex.EncodeToString(hash[:]), nil
 }

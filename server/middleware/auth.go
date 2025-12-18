@@ -3,7 +3,6 @@ package middleware
 import (
 	"context"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -13,22 +12,28 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// --- Context Keys (The Single Source of Truth) ---
 type contextKey string
 
 const (
-	AuthPrincipalIDKey    contextKey = "helix_auth_principal_id"    // string (UUID)
-	AuthPrincipalTypeKey  contextKey = "helix_auth_principal_type"  // string ("user", "service")
-	AuthPrincipalRoleKey  contextKey = "helix_auth_principal_roles" // []string
-	AuthPrincipalEmailKey contextKey = "helix_auth_principal_email" // string
+	AuthPrincipalIDKey    contextKey = "helix_auth_principal_id"
+	AuthPrincipalTypeKey  contextKey = "helix_auth_principal_type"
+	AuthPrincipalRoleKey  contextKey = "helix_auth_principal_roles"
+	AuthPrincipalEmailKey contextKey = "helix_auth_principal_email"
 )
 
-// --- The Strategy Interface (Inversion of Control) ---
-type AuthStrategy interface {
-	Authenticate(r *http.Request) (context.Context, error)
+// AuthPayload decouples the strategy from the transport (HTTP/gRPC).
+type AuthPayload struct {
+	Headers    map[string]string
+	RemoteAddr string
+	Method     string
+	Path       string
 }
 
-// ---  The Factory (Agnostic Middleware Generator) ---
+// AuthStrategy Interface (Protocol Agnostic)
+type AuthStrategy interface {
+	Authenticate(ctx context.Context, payload AuthPayload) (context.Context, error)
+}
+
 type AuthMiddleware struct {
 	strategy AuthStrategy
 }
@@ -39,12 +44,25 @@ func NewAuthMiddleware(strategy AuthStrategy) *AuthMiddleware {
 	}
 }
 
-// HTTPMiddleware: Standard interceptor
+// HTTPMiddleware: Adapts HTTP request to AuthPayload
 func (m *AuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, err := m.strategy.Authenticate(r)
+		headers := make(map[string]string)
+		for k, v := range r.Header {
+			if len(v) > 0 {
+				headers[http.CanonicalHeaderKey(k)] = v[0]
+			}
+		}
+
+		payload := AuthPayload{
+			Headers:    headers,
+			RemoteAddr: r.RemoteAddr,
+			Method:     r.Method,
+			Path:       r.URL.Path,
+		}
+
+		ctx, err := m.strategy.Authenticate(r.Context(), payload)
 		if err != nil {
-			// Strategi menentukan detail error, Middleware hanya enforcing.
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
@@ -52,59 +70,58 @@ func (m *AuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// GRPCUnaryInterceptor: Standard interceptor
+// GRPCUnaryInterceptor: Adapts gRPC metadata to AuthPayload
 func (m *AuthMiddleware) GRPCUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	// Extract Metadata sebagai Headers
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return nil, status.Error(codes.Unauthenticated, "metadata is not provided")
 	}
 
-	// Construct HTTP Request
-	mockReq := &http.Request{
-		Header: make(http.Header),
-		URL:    &url.URL{},
-	}
-
-	// Map Metadata to Header (Normalize keys)
+	headers := make(map[string]string)
 	for k, v := range md {
-		for _, val := range v {
-			mockReq.Header.Add(k, val)
+		if len(v) > 0 {
+			// gRPC metadata keys are always lowercase
+			headers[http.CanonicalHeaderKey(k)] = v[0]
+			// Also keep original for flexibility if needed, but Canonical is safer for matching
+			headers[k] = v[0]
 		}
 	}
 
-	// Extract Peer IP (Untuk TrustedHeaderStrategy CIDR Check)
+	remoteAddr := "0.0.0.0:0"
 	if p, ok := peer.FromContext(ctx); ok {
-		mockReq.RemoteAddr = p.Addr.String()
-	} else {
-		mockReq.RemoteAddr = "0.0.0.0:0" // Fallback jika tidak ada peer info
+		remoteAddr = p.Addr.String()
 	}
 
-	// Delegate ke Strategy (Reusing Logic)
-	newCtx, err := m.strategy.Authenticate(mockReq)
+	payload := AuthPayload{
+		Headers:    headers,
+		RemoteAddr: remoteAddr,
+		Method:     info.FullMethod,
+		Path:       info.FullMethod,
+	}
+
+	newCtx, err := m.strategy.Authenticate(ctx, payload)
 	if err != nil {
-		// Konversi error HTTP standar ke gRPC Status
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
 
-	// Lanjut ke Handler dengan Context baru (berisi Identity)
 	return handler(newCtx, req)
 }
 
-// Helper untuk gRPC Metadata extraction (Internal use - Legacy Support)
-func grpcExtractToken(ctx context.Context) (string, error) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return "", status.Error(codes.Unauthenticated, "metadata is not provided")
+// Helper to get Header value case-insensitively from the map
+func (p *AuthPayload) GetHeader(key string) string {
+	// Fast path
+	if v, ok := p.Headers[key]; ok {
+		return v
 	}
-	values := md["authorization"]
-	if len(values) == 0 {
-		return "", status.Error(codes.Unauthenticated, "authorization token is not provided")
+	if v, ok := p.Headers[http.CanonicalHeaderKey(key)]; ok {
+		return v
 	}
-	authHeader := values[0]
-	parts := strings.Split(authHeader, " ")
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		return "", status.Error(codes.Unauthenticated, "invalid auth header format")
+	// Slow path (iterate) - rare if canonicalized correctly
+	key = strings.ToLower(key)
+	for k, v := range p.Headers {
+		if strings.ToLower(k) == key {
+			return v
+		}
 	}
-	return parts[1], nil
+	return ""
 }
