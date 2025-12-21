@@ -6,6 +6,7 @@ type HelixClaims struct {
 	jwt.RegisteredClaims
 	Email string   `json:"email"`
 	Roles []string `json:"roles"`
+	Scope string   `json:"scope,omitempty"`
 }
 
 // GetRoles returns the roles safely.
