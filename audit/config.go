@@ -18,4 +18,5 @@ type Config struct {
 	MaxBodySize int64 `envconfig:"AUDIT_MAX_BODY_SIZE" default:"32768"`
 
 	ExcludePaths []string `envconfig:"AUDIT_EXCLUDE_PATHS" default:"/health,/metrics,/live,/ready"`
+	MaskFields   []string
 }
