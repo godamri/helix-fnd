@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/IBM/sarama"
 )
 
 // ConsumerConfig holds configuration for the Kafka consumer.
@@ -15,26 +16,21 @@ type ConsumerConfig struct {
 	Brokers string
 	GroupID string
 	Topic   string
-	// MaxRetries defines how many times to retry a message before giving up.
-	// Set to 0 for infinite retries (Recommended for strict data integrity).
+	// MaxRetries: 0 = infinite retries (Blocking until success)
 	MaxRetries int
-	// InitialBackoff defines the wait time for the first retry.
+	// Backoff configuration
 	InitialBackoff time.Duration
-	// MaxBackoff caps the exponential backoff duration.
-	MaxBackoff time.Duration
+	MaxBackoff     time.Duration
 }
 
-// HandlerFunc defines the signature for message processing.
-// Return error to trigger Retry.
-// Return nil to Commit Offset (Success or Poison Pill).
 type HandlerFunc func(ctx context.Context, key, payload []byte) error
 
 type Consumer struct {
-	consumer *kafka.Consumer
-	logger   *slog.Logger
-	cfg      ConsumerConfig
-	handler  HandlerFunc
-	running  bool
+	client  sarama.ConsumerGroup
+	logger  *slog.Logger
+	cfg     ConsumerConfig
+	handler HandlerFunc
+	ready   chan bool // Signal when consumer is setup
 }
 
 func NewConsumer(cfg ConsumerConfig, logger *slog.Logger, handler HandlerFunc) (*Consumer, error) {
@@ -45,91 +41,124 @@ func NewConsumer(cfg ConsumerConfig, logger *slog.Logger, handler HandlerFunc) (
 		cfg.MaxBackoff = 30 * time.Second
 	}
 
-	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers": cfg.Brokers,
-		"group.id":          cfg.GroupID,
-		"auto.offset.reset": "earliest",
-		// CRITICAL: We manage offsets manually to ensure At-Least-Once delivery
-		"enable.auto.commit": false,
-	})
+	config := sarama.NewConfig()
+	config.Version = sarama.V2_8_0_0 // Minimum stable version
+	config.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
+	config.Consumer.Offsets.Initial = sarama.OffsetOldest
+
+	// Disable auto-commit. Kita commit manual setelah sukses process (At-Least-Once).
+	config.Consumer.Offsets.AutoCommit.Enable = false
+
+	brokers := strings.Split(cfg.Brokers, ",")
+	client, err := sarama.NewConsumerGroup(brokers, cfg.GroupID, config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create consumer: %w", err)
+		return nil, fmt.Errorf("failed to create sarama consumer group: %w", err)
 	}
 
 	return &Consumer{
-		consumer: c,
-		logger:   logger,
-		cfg:      cfg,
-		handler:  handler,
+		client:  client,
+		logger:  logger,
+		cfg:     cfg,
+		handler: handler,
+		ready:   make(chan bool),
 	}, nil
 }
 
-// Start begins the consumption loop. It blocks until context is cancelled.
 func (c *Consumer) Start(ctx context.Context) error {
-	c.logger.Info("Starting consumer", "topic", c.cfg.Topic, "group", c.cfg.GroupID)
+	c.logger.Info("Starting Sarama consumer", "topic", c.cfg.Topic, "group", c.cfg.GroupID)
 
-	if err := c.consumer.SubscribeTopics([]string{c.cfg.Topic}, nil); err != nil {
-		return fmt.Errorf("failed to subscribe: %w", err)
+	// Sarama consumer group handler implementation
+	handler := &saramaHandler{
+		consumer: c,
+		ready:    c.ready,
 	}
 
-	c.running = true
-	defer func() {
-		c.running = false
-		c.consumer.Close()
-	}()
+	for {
+		// Consume should be called inside an infinite loop, when a server-side rebalance happens,
+		// the consumer session will need to be recreated to get the new claims
+		if err := c.client.Consume(ctx, []string{c.cfg.Topic}, handler); err != nil {
+			if errors.Is(err, sarama.ErrClosedConsumerGroup) {
+				return nil
+			}
+			c.logger.Error("Error from consumer", "error", err)
 
-	run := true
-	for run {
-		select {
-		case <-ctx.Done():
-			run = false
-			continue
-		default:
-			// Poll with timeout to allow context cancellation checks
-			ev := c.consumer.Poll(1000)
-			if ev == nil {
+			// Prevent tight loop on error
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
 				continue
 			}
-
-			switch e := ev.(type) {
-			case *kafka.Message:
-				// BLOCKING PROCESS: We do not proceed to the next message until this one is handled.
-				if err := c.processWithRetry(ctx, e); err != nil {
-					// If retry exhausted (and configured to fail), we log critical and move on
-					// OR if context cancelled, we exit.
-					if errors.Is(err, context.Canceled) {
-						return nil
-					}
-					c.logger.Error("Message dropped after max retries", "error", err, "key", string(e.Key))
-					// In a real robust system, here goes the DLQ logic.
-					// For now, we commit to prevent infinite loop on "Permanent Unknown Error" if MaxRetries > 0
-				}
-
-				// Commit Offset explicitly after success processing
-				_, err := c.consumer.CommitMessage(e)
-				if err != nil {
-					c.logger.Error("Failed to commit offset", "error", err)
-					// This implies duplicate delivery potential, which is acceptable (At-Least-Once)
-				}
-
-			case kafka.Error:
-				c.logger.Error("Kafka error", "code", e.Code(), "error", e.Error())
-				if e.IsFatal() {
-					return fmt.Errorf("fatal kafka error: %w", e)
-				}
-			}
 		}
+
+		// check if context was cancelled, signaling that the consumer should stop
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+}
+
+func (c *Consumer) Close() error {
+	return c.client.Close()
+}
+
+// =============================================================================
+// Sarama Handler Implementation
+// =============================================================================
+
+type saramaHandler struct {
+	consumer *Consumer
+	ready    chan bool
+}
+
+// Setup is run at the beginning of a new session, before ConsumeClaim
+func (h *saramaHandler) Setup(sarama.ConsumerGroupSession) error {
+	// Mark the consumer as ready
+	select {
+	case <-h.ready:
+	default:
+		close(h.ready)
 	}
 	return nil
 }
 
-// processWithRetry handles the exponential backoff loop
-func (c *Consumer) processWithRetry(ctx context.Context, msg *kafka.Message) error {
+// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
+func (h *saramaHandler) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+func (h *saramaHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	// NOTE:
+	// Do not move the code below to a goroutine.
+	// The `ConsumeClaim` itself is called within a goroutine, see:
+	// https://github.com/IBM/sarama/blob/main/consumer_group.go#L27-L29
+	for message := range claim.Messages() {
+		// BLOCKING PROCESS WITH RETRY
+		if err := h.consumer.processWithRetry(session.Context(), message); err != nil {
+			// If we exit here (e.g. Context Canceled), we stop processing this claim.
+			// Offsets won't be marked for this message.
+			return err
+		}
+
+		// Mark message as processed. Sarama will auto-commit marked offsets periodically
+		// if AutoCommit is enabled, OR we can commit explicitly.
+		// Since we disabled AutoCommit in config, we rely on session state or explicit commit.
+		// Actually, Sarama's "MarkMessage" just updates the in-memory state.
+		// We need to ensure offsets are committed.
+
+		session.MarkMessage(message, "")
+		session.Commit() // Force commit immediately (At-Least-Once)
+	}
+
+	return nil
+}
+
+func (c *Consumer) processWithRetry(ctx context.Context, msg *sarama.ConsumerMessage) error {
 	attempt := 0
 	backoff := c.cfg.InitialBackoff
 
 	for {
-		// Check context before processing
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -142,35 +171,26 @@ func (c *Consumer) processWithRetry(ctx context.Context, msg *kafka.Message) err
 
 		attempt++
 
-		// Check Max Retries (if set)
+		// Check Max Retries
 		if c.cfg.MaxRetries > 0 && attempt >= c.cfg.MaxRetries {
-			return fmt.Errorf("max retries exceeded: %w", err)
+			c.logger.Error("Max retries exceeded. Dropping message.", "error", err, "key", string(msg.Key))
+			return nil // Return nil to allow Commit (Data Loss / DLQ scenario)
 		}
 
-		// Log and Wait
-		c.logger.Warn("Transient processing failure, retrying...",
+		c.logger.Warn("Transient failure, retrying...",
 			"attempt", attempt,
 			"error", err,
-			"next_retry_in", backoff,
+			"backoff", backoff.String(),
 		)
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(backoff):
-			// Exponential Backoff with Jitter cap
 			backoff *= 2
 			if backoff > c.cfg.MaxBackoff {
 				backoff = c.cfg.MaxBackoff
 			}
 		}
 	}
-}
-
-// Ensure this exists
-func (c *Consumer) Close() error {
-	if c.consumer != nil {
-		return c.consumer.Close()
-	}
-	return nil
 }
