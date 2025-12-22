@@ -166,3 +166,11 @@ func (c *Consumer) processWithRetry(ctx context.Context, msg *kafka.Message) err
 		}
 	}
 }
+
+// Ensure this exists
+func (c *Consumer) Close() error {
+	if c.consumer != nil {
+		return c.consumer.Close()
+	}
+	return nil
+}
