@@ -7,12 +7,12 @@ import (
 	"log"
 	"time"
 
-	"github.com/IBM/sarama"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 type KafkaLogger struct {
-	producer sarama.AsyncProducer
-	topic    string
+	client *kgo.Client
+	topic  string
 }
 
 func NewKafkaLogger(brokers []string, topic string) (*KafkaLogger, error) {
@@ -20,27 +20,32 @@ func NewKafkaLogger(brokers []string, topic string) (*KafkaLogger, error) {
 		topic = "system.audit.events"
 	}
 
-	config := sarama.NewConfig()
-	config.Producer.Return.Successes = false
-	config.Producer.Return.Errors = true
-	config.Producer.RequiredAcks = sarama.WaitForLocal
+	// Franz-go options for Audit Logging
+	// We prioritize throughput and compression over absolute latency here.
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.ProducerBatchCompression(kgo.SnappyCompression()), // Good balance
+		kgo.AllowAutoTopicCreation(),                          // Helpful for audit topics
+		kgo.RecordPartitioner(kgo.RoundRobinPartitioner()),    // Even distribution since we have no keys
+	}
 
-	config.Producer.Flush.Frequency = 500 * time.Millisecond
-	config.Producer.Flush.Messages = 100
-
-	producer, err := sarama.NewAsyncProducer(brokers, config)
+	client, err := kgo.NewClient(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("audit: failed to start kafka producer: %w", err)
+		return nil, fmt.Errorf("audit: failed to create franz-go client: %w", err)
 	}
 
-	logger := &KafkaLogger{
-		producer: producer,
-		topic:    topic,
+	// Fail-fast connectivity check
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("audit: failed to connect to brokers: %w", err)
 	}
 
-	go logger.drainErrors()
-
-	return logger, nil
+	return &KafkaLogger{
+		client: client,
+		topic:  topic,
+	}, nil
 }
 
 func (k *KafkaLogger) Log(ctx context.Context, event Event) error {
@@ -49,25 +54,24 @@ func (k *KafkaLogger) Log(ctx context.Context, event Event) error {
 		return fmt.Errorf("audit: marshal failed: %w", err)
 	}
 
-	msg := &sarama.ProducerMessage{
+	record := &kgo.Record{
 		Topic: k.topic,
-		Value: sarama.ByteEncoder(payload),
+		Value: payload,
+		// No Key: We want round-robin distribution for max throughput
 	}
 
-	select {
-	case k.producer.Input() <- msg:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
+	// ASYNC PRODUCE
+	k.client.Produce(ctx, record, func(r *kgo.Record, err error) {
+		if err != nil {
+			// Simple, direct callback handling.
+			log.Printf("audit: failed to send log to kafka: %v\n", err)
+		}
+	})
 
-func (k *KafkaLogger) drainErrors() {
-	for err := range k.producer.Errors() {
-		log.Printf("audit: failed to send log to kafka: %v\n", err)
-	}
+	return nil
 }
 
 func (k *KafkaLogger) Close() error {
-	return k.producer.Close()
+	k.client.Close() // Flushes buffers and closes
+	return nil
 }

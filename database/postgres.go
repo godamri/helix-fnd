@@ -13,9 +13,9 @@ import (
 // Config holds standard database configuration.
 type Config struct {
 	DSN             string        `envconfig:"DB_DSN" required:"true"`
-	MaxOpenConns    int           `envconfig:"DB_MAX_OPEN_CONNS" default:"25"`
-	MaxIdleConns    int           `envconfig:"DB_MAX_IDLE_CONNS" default:"5"`
-	ConnMaxLifetime time.Duration `envconfig:"DB_CONN_MAX_LIFETIME" default:"15m"`
+	MaxOpenConns    int           `envconfig:"DB_MAX_OPEN_CONNS" default:"50"`
+	MaxIdleConns    int           `envconfig:"DB_MAX_IDLE_CONNS" default:"25"`
+	ConnMaxLifetime time.Duration `envconfig:"DB_CONN_MAX_LIFETIME" default:"30m"`
 }
 
 // NewPostgres initializes a *sql.DB with OpenTelemetry instrumentation and connection pooling.

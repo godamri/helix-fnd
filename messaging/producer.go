@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/IBM/sarama"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 )
@@ -16,65 +16,64 @@ type Config struct {
 }
 
 type Producer struct {
-	producer sarama.SyncProducer // CHANGE: SyncProducer for strict guarantees
-	logger   *slog.Logger
+	client *kgo.Client
+	logger *slog.Logger
 }
 
 func NewProducer(cfg Config, logger *slog.Logger) (*Producer, error) {
-	conf := sarama.NewConfig()
-	conf.Version = sarama.V2_8_0_0 // Explicit versioning is safer
+	// Franz-go options
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(cfg.Brokers...),
+		kgo.ProducerBatchCompression(kgo.SnappyCompression()), // Efficient compression
+		kgo.AllowAutoTopicCreation(),                          // Dev-friendly, maybe disable for strictly prod
+		kgo.RetryTimeout(10 * time.Second),                    // Global timeout for retries
+	}
 
-	// RELIABILITY SETTINGS
-	// WaitForAll: Wait for all in-sync replicas to ack.
-	conf.Producer.RequiredAcks = sarama.WaitForAll
-
-	// Idempotent: Ensures exactly-once delivery within a session.
-	// Prevents duplicates if ack is lost but write succeeded.
-	conf.Producer.Idempotent = true
-	conf.Net.MaxOpenRequests = 1 // Required for Idempotency if version < 2.x, good practice for order
-
-	// Return.Successes MUST be true for SyncProducer
-	conf.Producer.Return.Successes = true
-	conf.Producer.Return.Errors = true
-
-	conf.Producer.Retry.Max = 10
-	conf.Producer.Retry.Backoff = 100 * time.Millisecond
-
-	p, err := sarama.NewSyncProducer(cfg.Brokers, conf)
+	client, err := kgo.NewClient(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("kafka: failed to start sync producer: %w", err)
+		return nil, fmt.Errorf("kafka: failed to create franz-go client: %w", err)
+	}
+
+	// Verify connectivity
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("kafka: failed to ping brokers: %w", err)
 	}
 
 	return &Producer{
-		producer: p,
-		logger:   logger,
+		client: client,
+		logger: logger,
 	}, nil
 }
 
 // Publish sends a message and BLOCKS until Kafka acknowledges it.
 // This is critical for the Outbox pattern to ensure DB and Kafka are consistent.
 func (p *Producer) Publish(ctx context.Context, topic, key string, payload []byte) error {
-	msg := &sarama.ProducerMessage{
-		Topic:     topic,
-		Key:       sarama.StringEncoder(key),
-		Value:     sarama.ByteEncoder(payload),
-		Timestamp: time.Now(),
+	record := &kgo.Record{
+		Topic: topic,
+		Key:   []byte(key),
+		Value: payload,
 	}
 
 	// Inject Tracing Context
+	// Franz-go records allow adding headers natively
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
 
 	for k, v := range carrier {
-		msg.Headers = append(msg.Headers, sarama.RecordHeader{
-			Key:   []byte(k),
+		record.Headers = append(record.Headers, kgo.RecordHeader{
+			Key:   k,
 			Value: []byte(v),
 		})
 	}
 
-	// BLOCKING CALL
-	partition, offset, err := p.producer.SendMessage(msg)
-	if err != nil {
+	// SYNC PRODUCE for Outbox Reliability
+	// We wait for the result.
+	res := p.client.ProduceSync(ctx, record)
+
+	if err := res.FirstErr(); err != nil {
 		p.logger.Error("Failed to publish message",
 			"topic", topic,
 			"key", key,
@@ -83,16 +82,14 @@ func (p *Producer) Publish(ctx context.Context, topic, key string, payload []byt
 		return fmt.Errorf("kafka publish failed: %w", err)
 	}
 
-	p.logger.Debug("Message published",
-		"topic", topic,
-		"partition", partition,
-		"offset", offset,
-	)
+	// Optional: Log success (debug level)
+	// p.logger.Debug("Message published", "topic", topic, "partition", res.First().Partition)
 
 	return nil
 }
 
 func (p *Producer) Close() error {
-	p.logger.Info("Closing Kafka SyncProducer...")
-	return p.producer.Close()
+	p.logger.Info("Closing Kafka Producer...")
+	p.client.Close() // Blocks until buffered messages are flushed
+	return nil
 }

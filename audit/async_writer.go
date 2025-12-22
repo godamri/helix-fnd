@@ -12,18 +12,22 @@ import (
 )
 
 type AsyncLogger struct {
-	events    chan Event
-	writer    io.Writer
-	wg        sync.WaitGroup
-	logger    *slog.Logger
-	closeOnce sync.Once
+	events      chan Event
+	writer      io.Writer
+	wg          sync.WaitGroup
+	logger      *slog.Logger
+	closeOnce   sync.Once
+	blockOnFull bool
 
 	// Drop Strategy Stats
 	dropCount   uint64
 	lastLogTime atomic.Value // Stores time.Time
 }
 
-func NewAsyncLogger(w io.Writer, bufferSize int, logger *slog.Logger) *AsyncLogger {
+// NewAsyncLogger creates a logger.
+// If blockOnFull is true, logging will BLOCK if the buffer is full (High Consistency).
+// If false, it drops logs to preserve availability (High Availability).
+func NewAsyncLogger(w io.Writer, bufferSize int, blockOnFull bool, logger *slog.Logger) *AsyncLogger {
 	if w == nil {
 		w = os.Stdout
 	}
@@ -32,9 +36,10 @@ func NewAsyncLogger(w io.Writer, bufferSize int, logger *slog.Logger) *AsyncLogg
 	}
 
 	l := &AsyncLogger{
-		events: make(chan Event, bufferSize),
-		writer: w,
-		logger: logger,
+		events:      make(chan Event, bufferSize),
+		writer:      w,
+		logger:      logger,
+		blockOnFull: blockOnFull,
 	}
 	l.lastLogTime.Store(time.Unix(0, 0))
 
@@ -50,13 +55,28 @@ func (l *AsyncLogger) Log(ctx context.Context, event Event) error {
 		event.Timestamp = time.Now()
 	}
 
-	select {
-	case l.events <- event:
-		return nil
-	default:
-		// Buffer full. Drop log and increment counter for metrics.
-		l.handleDrop(event.Action)
-		return nil
+	if l.blockOnFull {
+		// STRATEGY: High Consistency (Payment/Ledger)
+		// We block until space is available or context is cancelled.
+		select {
+		case l.events <- event:
+			return nil
+		case <-ctx.Done():
+			// Context cancelled (timeout/shutdown)
+			l.handleDrop(event.Action)
+			return ctx.Err()
+		}
+	} else {
+		// STRATEGY: High Availability (General logging)
+		// Try to send, if full -> drop immediately.
+		select {
+		case l.events <- event:
+			return nil
+		default:
+			// Buffer full. Drop log and increment counter for metrics.
+			l.handleDrop(event.Action)
+			return nil
+		}
 	}
 }
 
@@ -78,7 +98,7 @@ func (l *AsyncLogger) handleDrop(action string) {
 			slog.Uint64("dropped_count", totalDropped),
 			slog.String("reason", "buffer_full"),
 			slog.String("sample_action", action),
-			slog.String("strategy", "availability_first"),
+			slog.Bool("blocking_mode", l.blockOnFull),
 		)
 	}
 }
