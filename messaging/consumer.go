@@ -40,7 +40,7 @@ func NewConsumer(cfg ConsumerConfig, logger *slog.Logger, handler HandlerFunc) (
 	}
 
 	opts := []kgo.Opt{
-		kgo.SeedBrokers(cfg.Brokers),
+		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ConsumerGroup(cfg.GroupID),
 		kgo.ConsumeTopics(cfg.Topic),
 		kgo.DisableAutoCommit(), // We commit manually after success
