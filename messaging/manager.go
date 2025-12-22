@@ -6,20 +6,21 @@ import (
 	"sync"
 )
 
-// ConsumerManager orchestrates multiple consumer groups.
+// ConsumerManager handles the lifecycle of multiple Kafka consumers.
 type ConsumerManager struct {
+	logger    *slog.Logger
 	consumers []*Consumer
 	wg        sync.WaitGroup
-	logger    *slog.Logger
 }
 
 func NewConsumerManager(logger *slog.Logger) *ConsumerManager {
 	return &ConsumerManager{
-		logger: logger,
+		logger:    logger.With("component", "consumer_manager"),
+		consumers: []*Consumer{},
 	}
 }
 
-// Register adds a consumer to the manager.
+// Register adds a consumer to be managed.
 func (m *ConsumerManager) Register(c *Consumer) {
 	m.consumers = append(m.consumers, c)
 }
@@ -31,7 +32,7 @@ func (m *ConsumerManager) Start(ctx context.Context) {
 		go func(consumer *Consumer) {
 			defer m.wg.Done()
 			if err := consumer.Start(ctx); err != nil {
-				m.logger.Error("Consumer stopped with error", "topics", consumer.topics, "error", err)
+				m.logger.Error("Consumer stopped with error", "topic", consumer.cfg.Topic, "error", err)
 			}
 		}(c)
 	}
