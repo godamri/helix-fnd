@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/godamri/helix-fnd/pkg/contextx"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -26,7 +27,7 @@ func GRPCRateLimitInterceptor(rdb *redis.Client, rate int, burst int, period tim
 
 		// Rule: Explicit identity identification.
 		var identity string
-		if user := ctx.Value(AuthPrincipalIDKey); user != nil {
+		if user := ctx.Value(contextx.AuthPrincipalIDKey); user != nil {
 			identity = fmt.Sprintf("user:%v", user)
 		} else {
 			identity = "ip:unknown"

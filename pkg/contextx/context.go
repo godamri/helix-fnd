@@ -7,6 +7,8 @@ import (
 type contextKey string
 
 const (
+	AuthPrincipalIDKey contextKey = "helix.auth_principal_id"
+
 	TraceIDKey       contextKey = "helix.trace_id"
 	ParentTraceIDKey contextKey = "helix.parent_trace_id"
 	SpanIDKey        contextKey = "helix.span_id"

@@ -10,6 +10,7 @@ import (
 
 	"sync"
 
+	"github.com/godamri/helix-fnd/pkg/contextx"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/time/rate"
 )
@@ -77,7 +78,7 @@ func RateLimitMiddleware(rdb *redis.Client, rps int, burst int, period time.Dura
 
 			// Resolve Identity
 			var identity string
-			if user := r.Context().Value(AuthPrincipalIDKey); user != nil {
+			if user := r.Context().Value(contextx.AuthPrincipalIDKey); user != nil {
 				identity = fmt.Sprintf("user:%v", user)
 			} else {
 				identity = "ip:" + getRealIP(r)
