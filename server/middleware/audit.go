@@ -14,11 +14,7 @@ import (
 	"github.com/godamri/helix-fnd/pkg/contextx"
 )
 
-// AuditMiddleware records business events for non-GET requests.
-// It captures Actor, Action, Resource, Status, and Payload (capped).
 func AuditMiddleware(logger audit.Logger, cfg audit.Config) func(http.Handler) http.Handler {
-	// Pre-process exclude paths for O(1) lookup map if list is long,
-	// but slice iteration is fine for short lists.
 	skipPaths := make(map[string]bool)
 	for _, p := range cfg.ExcludePaths {
 		skipPaths[strings.TrimSpace(p)] = true
@@ -26,13 +22,11 @@ func AuditMiddleware(logger audit.Logger, cfg audit.Config) func(http.Handler) h
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip GET/OPTIONS (Read-only usually not audited in high-throughput, optional)
 			if r.Method == http.MethodGet || r.Method == http.MethodOptions {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Skip Excluded Paths
 			if skipPaths[r.URL.Path] {
 				next.ServeHTTP(w, r)
 				return
@@ -40,26 +34,19 @@ func AuditMiddleware(logger audit.Logger, cfg audit.Config) func(http.Handler) h
 
 			start := time.Now()
 
-			// Body Capture with Configurable Limit
 			var reqBody []byte
 			if r.Body != nil && cfg.MaxBodySize > 0 {
-				// Use the configured limit
 				limitReader := io.LimitReader(r.Body, cfg.MaxBodySize)
 				reqBody, _ = io.ReadAll(limitReader)
-
-				// Restore body so the handler can read it.
-				// We reconstruct the body using the bytes we read + the rest of the stream.
 				r.Body = io.NopCloser(io.MultiReader(bytes.NewBuffer(reqBody), r.Body))
 			}
 
 			ww := chiMiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
-
 			next.ServeHTTP(ww, r)
 
-			// Async Log
-			actorID := "anonymous"
-			if u, ok := r.Context().Value(AuthPrincipalIDKey).(string); ok {
-				actorID = u
+			actorID := contextx.GetActorID(r.Context())
+			if actorID == "" {
+				actorID = "anonymous"
 			}
 
 			path := r.URL.Path
@@ -74,14 +61,19 @@ func AuditMiddleware(logger audit.Logger, cfg audit.Config) func(http.Handler) h
 				Timestamp: start,
 				TraceID:   contextx.GetTraceID(r.Context()),
 				Metadata: map[string]string{
-					"status":     http.StatusText(ww.Status()),
-					"ip":         r.RemoteAddr,
-					"user_agent": r.UserAgent(),
+					"status":          http.StatusText(ww.Status()),
+					"ip":              r.RemoteAddr,
+					"user_agent":      r.UserAgent(),
+					"actor_type":      contextx.GetActorType(r.Context()),
+					"org_id":          contextx.GetOrgID(r.Context()),
+					"entry_point":     contextx.GetEntryPoint(r.Context()),
+					"request_id":      contextx.GetRequestID(r.Context()),
+					"auth_method":     contextx.GetAuthMethod(r.Context()),
+					"idempotency_key": contextx.GetIdempotencyKey(r.Context()),
 				},
 				NewValue: string(reqBody),
 			}
 
-			// Use background context to prevent cancellation
 			_ = logger.Log(context.Background(), event)
 		})
 	}

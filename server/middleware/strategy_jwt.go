@@ -7,9 +7,9 @@ import (
 	"strings"
 
 	"github.com/godamri/helix-fnd/crypto"
+	"github.com/godamri/helix-fnd/pkg/contextx"
 )
 
-// JWTStrategy for Standalone/Dev mode.
 type JWTStrategy struct {
 	verifier crypto.JWKSVerifier
 	logger   *slog.Logger
@@ -26,7 +26,6 @@ func NewJWTStrategy(verifier crypto.JWKSVerifier, logger *slog.Logger) *JWTStrat
 }
 
 func (s *JWTStrategy) Authenticate(ctx context.Context, payload AuthPayload) (context.Context, error) {
-	// Extract Bearer Token
 	authHeader := payload.GetHeader("Authorization")
 	if authHeader == "" {
 		return nil, errors.New("missing authorization header")
@@ -39,18 +38,26 @@ func (s *JWTStrategy) Authenticate(ctx context.Context, payload AuthPayload) (co
 
 	tokenStr := parts[1]
 
-	// Verify
 	claims, err := s.verifier.VerifyToken(tokenStr)
 	if err != nil {
 		s.logger.WarnContext(ctx, "JWT verification failed", "error", err, "ip", payload.RemoteAddr)
 		return nil, errors.New("invalid token")
 	}
 
-	// Hydrate
-	ctx = context.WithValue(ctx, AuthPrincipalIDKey, claims.Subject)
-	ctx = context.WithValue(ctx, AuthPrincipalTypeKey, "user")
-	ctx = context.WithValue(ctx, AuthPrincipalRoleKey, claims.GetRoles())
-	ctx = context.WithValue(ctx, AuthPrincipalEmailKey, claims.Email)
+	ctx = contextx.WithAuthMethod(ctx, "jwt")
+
+	if claims.ID != "" {
+		ctx = contextx.WithSessionID(ctx, claims.ID)
+	}
+
+	ctx = contextx.WithIdentity(
+		ctx,
+		claims.Subject,        // UserID
+		claims.OrgID,          // OrgID
+		claims.Email,          // Email
+		claims.GetActorType(), // human | service | system
+		claims.GetRoles(),     // Roles/Permissions
+	)
 
 	return ctx, nil
 }

@@ -3,6 +3,7 @@ package audit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+var ErrAuditBufferFull = errors.New("audit: buffer full, log dropped")
 
 type AsyncLogger struct {
 	events      chan Event
@@ -21,12 +24,9 @@ type AsyncLogger struct {
 
 	// Drop Strategy Stats
 	dropCount   uint64
-	lastLogTime atomic.Value // Stores time.Time
+	lastLogTime atomic.Value
 }
 
-// NewAsyncLogger creates a logger.
-// If blockOnFull is true, logging will BLOCK if the buffer is full (High Consistency).
-// If false, it drops logs to preserve availability (High Availability).
 func NewAsyncLogger(w io.Writer, bufferSize int, blockOnFull bool, logger *slog.Logger) *AsyncLogger {
 	if w == nil {
 		w = os.Stdout
@@ -49,38 +49,32 @@ func NewAsyncLogger(w io.Writer, bufferSize int, blockOnFull bool, logger *slog.
 	return l
 }
 
-// Log attempts to queue an event.
 func (l *AsyncLogger) Log(ctx context.Context, event Event) error {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
 	}
 
 	if l.blockOnFull {
-		// STRATEGY: High Consistency (Payment/Ledger)
-		// We block until space is available or context is cancelled.
+		// STRATEGY: High Consistency
 		select {
 		case l.events <- event:
 			return nil
 		case <-ctx.Done():
-			// Context cancelled (timeout/shutdown)
 			l.handleDrop(event.Action)
 			return ctx.Err()
 		}
 	} else {
-		// STRATEGY: High Availability (General logging)
-		// Try to send, if full -> drop immediately.
+		// STRATEGY: High Availability
 		select {
 		case l.events <- event:
 			return nil
 		default:
-			// Buffer full. Drop log and increment counter for metrics.
 			l.handleDrop(event.Action)
-			return nil
+			return ErrAuditBufferFull
 		}
 	}
 }
 
-// handleDrop performs rate-limited logging (1 log per 5 minutes) to prevent log flooding.
 func (l *AsyncLogger) handleDrop(action string) {
 	atomic.AddUint64(&l.dropCount, 1)
 
@@ -90,13 +84,14 @@ func (l *AsyncLogger) handleDrop(action string) {
 		lastLog = time.Unix(0, 0)
 	}
 
-	if now.Sub(lastLog) > 5*time.Minute {
+	// Rate-limited warning to stderr/slog to notify ops that the system is under pressure
+	if now.Sub(lastLog) > 1*time.Minute {
 		l.lastLogTime.Store(now)
 		totalDropped := atomic.SwapUint64(&l.dropCount, 0)
 
-		l.logger.Warn("AUDIT_LOG_DROPPED",
+		l.logger.Error("AUDIT_LOG_CRITICAL_FAILURE",
 			slog.Uint64("dropped_count", totalDropped),
-			slog.String("reason", "buffer_full"),
+			slog.String("reason", "buffer_full_or_timeout"),
 			slog.String("sample_action", action),
 			slog.Bool("blocking_mode", l.blockOnFull),
 		)

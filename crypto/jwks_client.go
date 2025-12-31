@@ -45,7 +45,7 @@ type CachingClient struct {
 	sf               singleflight.Group
 }
 
-func NewJWKSCachingClient(jwksURL string, issuer string, refreshInterval time.Duration, maxStaleDuration time.Duration, logger *slog.Logger) (JWKSVerifier, error) {
+func NewJWKSCachingClient(ctx context.Context, jwksURL string, issuer string, refreshInterval time.Duration, maxStaleDuration time.Duration, logger *slog.Logger) (JWKSVerifier, error) {
 	if jwksURL == "" || issuer == "" {
 		return nil, errors.New("jwks client: URL and Issuer are mandatory")
 	}
@@ -65,12 +65,11 @@ func NewJWKSCachingClient(jwksURL string, issuer string, refreshInterval time.Du
 		},
 	}
 
-	// Fail-fast on startup
-	if err := c.fetchKeys(context.Background()); err != nil {
+	if err := c.fetchKeys(ctx); err != nil {
 		return nil, fmt.Errorf("jwks client: FATAL on initial key fetch: %w", err)
 	}
 
-	go c.startKeyRefresher(context.Background(), refreshInterval)
+	go c.startKeyRefresher(ctx, refreshInterval)
 
 	return c, nil
 }
@@ -79,27 +78,27 @@ func (c *CachingClient) startKeyRefresher(ctx context.Context, interval time.Dur
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	c.log.Info("JWKS Caching Client started",
+	c.log.Info("JWKS Caching Client background refresher started",
 		"interval", interval.String(),
-		"stale_limit", c.maxStaleDuration.String(),
 		"url", c.jwksURL,
 	)
 
 	for {
 		select {
 		case <-ctx.Done():
-			c.log.Info("JWKS Caching Client shutting down.")
+			c.log.Info("JWKS Caching Client refresher shutting down...")
 			return
 		case <-ticker.C:
 			refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			if err := c.doRefresh(refreshCtx); err != nil {
-				timeSinceUpdate := time.Since(c.lastUpdated)
-				c.log.Error("Failed to refresh JWKS keys",
+				c.mu.RLock()
+				age := time.Since(c.lastUpdated)
+				c.mu.RUnlock()
+
+				c.log.Error("Failed to auto-refresh JWKS keys",
 					"error", err,
-					"cache_age", timeSinceUpdate.String(),
+					"cache_age", age.String(),
 				)
-			} else {
-				c.log.Debug("JWKS keys refreshed successfully")
 			}
 			cancel()
 		}
@@ -136,22 +135,19 @@ func (c *CachingClient) fetchKeys(ctx context.Context) error {
 
 	newCache := make(map[string]*rsa.PublicKey)
 	for _, jwk := range newJwks.Keys {
-		if jwk.Kty != "RSA" || jwk.Use != "sig" {
-			continue
-		}
-		if jwk.Kid == "" {
+		if jwk.Kty != "RSA" || jwk.Use != "sig" || jwk.Kid == "" {
 			continue
 		}
 		key, err := jwk.toRSAPublicKey()
 		if err != nil {
-			c.log.Warn("Failed to convert JWK", "kid", jwk.Kid, "error", err)
+			c.log.Warn("Skipping invalid JWK", "kid", jwk.Kid, "error", err)
 			continue
 		}
 		newCache[jwk.Kid] = key
 	}
 
 	if len(newCache) == 0 {
-		return errors.New("JWKS response contains zero valid RSA keys for signature")
+		return errors.New("JWKS response contains zero valid RSA keys")
 	}
 
 	c.mu.Lock()
@@ -174,17 +170,9 @@ func (j *jsonWebKey) toRSAPublicKey() (*rsa.PublicKey, error) {
 		return nil, fmt.Errorf("invalid exponent (e): %w", err)
 	}
 
-	if len(eBytes) == 0 {
-		return nil, errors.New("invalid exponent (e): empty bytes")
-	}
-
 	eVal := 0
 	for _, b := range eBytes {
 		eVal = (eVal << 8) | int(b)
-	}
-
-	if eVal == 0 {
-		return nil, errors.New("invalid exponent (e): value is zero")
 	}
 
 	return &rsa.PublicKey{N: n, E: eVal}, nil
@@ -195,35 +183,28 @@ var (
 	ErrExpiredToken = errors.New("crypto: token expired")
 )
 
-// VerifyToken validates the JWT using cached keys.
 func (c *CachingClient) VerifyToken(tokenString string) (*HelixClaims, error) {
-	// Audit Stale Cache (Non-blocking check)
 	c.mu.RLock()
-	cacheAge := time.Since(c.lastUpdated)
+	lastUpd := c.lastUpdated
 	c.mu.RUnlock()
 
-	if cacheAge > c.maxStaleDuration {
-		c.log.Error("CRITICAL: JWKS keys are stale. Auth Provider unreachable?",
-			"age", cacheAge.String(),
+	if time.Since(lastUpd) > c.maxStaleDuration {
+		c.log.Error("CRITICAL: JWKS cache is stale beyond limit",
+			"age", time.Since(lastUpd).String(),
 			"limit", c.maxStaleDuration.String(),
-			"action", "using_stale_cache_to_maintain_availability",
 		)
 	}
 
-	// Parse & Verify in one go (Avoids double parsing)
 	token, err := jwt.ParseWithClaims(tokenString, &HelixClaims{}, func(token *jwt.Token) (interface{}, error) {
-		// Validate Algo
 		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 
-		// Extract Key ID
 		kid, ok := token.Header["kid"].(string)
 		if !ok || kid == "" {
-			return nil, errors.New("missing or invalid kid in header")
+			return nil, errors.New("missing kid in token header")
 		}
 
-		// Cache Lookup
 		c.mu.RLock()
 		key, found := c.cache[kid]
 		c.mu.RUnlock()
@@ -232,20 +213,20 @@ func (c *CachingClient) VerifyToken(tokenString string) (*HelixClaims, error) {
 			return key, nil
 		}
 
-		// Cache Miss? Try Refresh (Singleflight protected)
-		c.log.Info("Key ID not found in cache. Attempting refresh...", "kid", kid)
-		if err := c.doRefresh(context.Background()); err != nil {
-			// If refresh fails, we can't find the key
-			return nil, fmt.Errorf("failed key refresh: %w", err)
+		c.log.Info("Key ID miss, attempting emergency refresh...", "kid", kid)
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := c.doRefresh(refreshCtx); err != nil {
+			return nil, fmt.Errorf("failed emergency key refresh: %w", err)
 		}
 
-		// Retry Lookup after refresh
 		c.mu.RLock()
 		key, found = c.cache[kid]
 		c.mu.RUnlock()
 
 		if !found {
-			return nil, fmt.Errorf("kid %s not found in JWKS even after refresh", kid)
+			return nil, fmt.Errorf("kid %s not found in JWKS even after emergency refresh", kid)
 		}
 
 		return key, nil
@@ -261,9 +242,16 @@ func (c *CachingClient) VerifyToken(tokenString string) (*HelixClaims, error) {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 
-	if claims, ok := token.Claims.(*HelixClaims); ok && token.Valid {
-		return claims, nil
+	claims, ok := token.Claims.(*HelixClaims)
+	if !ok || !token.Valid {
+		return nil, ErrInvalidToken
 	}
 
-	return nil, ErrInvalidToken
+	if exp, err := claims.GetExpirationTime(); err == nil {
+		if time.Now().Add(-5 * time.Second).After(exp.Time) {
+			return nil, ErrExpiredToken
+		}
+	}
+
+	return claims, nil
 }

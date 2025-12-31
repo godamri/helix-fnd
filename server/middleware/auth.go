@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/godamri/helix-fnd/pkg/contextx"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -12,16 +13,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-type contextKey string
-
-const (
-	AuthPrincipalIDKey    contextKey = "helix_auth_principal_id"
-	AuthPrincipalTypeKey  contextKey = "helix_auth_principal_type"
-	AuthPrincipalRoleKey  contextKey = "helix_auth_principal_roles"
-	AuthPrincipalEmailKey contextKey = "helix_auth_principal_email"
-)
-
-// AuthPayload decouples the strategy from the transport (HTTP/gRPC).
 type AuthPayload struct {
 	Headers    map[string]string
 	RemoteAddr string
@@ -29,7 +20,6 @@ type AuthPayload struct {
 	Path       string
 }
 
-// AuthStrategy Interface (Protocol Agnostic)
 type AuthStrategy interface {
 	Authenticate(ctx context.Context, payload AuthPayload) (context.Context, error)
 }
@@ -44,9 +34,10 @@ func NewAuthMiddleware(strategy AuthStrategy) *AuthMiddleware {
 	}
 }
 
-// HTTPMiddleware: Adapts HTTP request to AuthPayload
 func (m *AuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := contextx.WithEntryPoint(r.Context(), "http")
+
 		headers := make(map[string]string)
 		for k, v := range r.Header {
 			if len(v) > 0 {
@@ -61,7 +52,7 @@ func (m *AuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 			Path:       r.URL.Path,
 		}
 
-		ctx, err := m.strategy.Authenticate(r.Context(), payload)
+		ctx, err := m.strategy.Authenticate(ctx, payload)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
@@ -70,8 +61,9 @@ func (m *AuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// GRPCUnaryInterceptor: Adapts gRPC metadata to AuthPayload
 func (m *AuthMiddleware) GRPCUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	ctx = contextx.WithEntryPoint(ctx, "grpc")
+
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return nil, status.Error(codes.Unauthenticated, "metadata is not provided")
@@ -80,10 +72,7 @@ func (m *AuthMiddleware) GRPCUnaryInterceptor(ctx context.Context, req interface
 	headers := make(map[string]string)
 	for k, v := range md {
 		if len(v) > 0 {
-			// gRPC metadata keys are always lowercase
 			headers[http.CanonicalHeaderKey(k)] = v[0]
-			// Also keep original for flexibility if needed, but Canonical is safer for matching
-			headers[k] = v[0]
 		}
 	}
 
@@ -107,16 +96,10 @@ func (m *AuthMiddleware) GRPCUnaryInterceptor(ctx context.Context, req interface
 	return handler(newCtx, req)
 }
 
-// Helper to get Header value case-insensitively from the map
 func (p *AuthPayload) GetHeader(key string) string {
-	// Fast path
-	if v, ok := p.Headers[key]; ok {
-		return v
-	}
 	if v, ok := p.Headers[http.CanonicalHeaderKey(key)]; ok {
 		return v
 	}
-	// Slow path (iterate) - rare if canonicalized correctly
 	key = strings.ToLower(key)
 	for k, v := range p.Headers {
 		if strings.ToLower(k) == key {
