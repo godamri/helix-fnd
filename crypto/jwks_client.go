@@ -247,9 +247,16 @@ func (c *CachingClient) VerifyToken(tokenString string) (*HelixClaims, error) {
 		return nil, ErrInvalidToken
 	}
 
+	now := time.Now()
 	if exp, err := claims.GetExpirationTime(); err == nil {
-		if time.Now().Add(-5 * time.Second).After(exp.Time) {
+		if now.Add(-1 * time.Minute).After(exp.Time) {
 			return nil, ErrExpiredToken
+		}
+	}
+
+	if nbf, err := claims.GetNotBefore(); err == nil && nbf != nil {
+		if now.Add(1 * time.Minute).Before(nbf.Time) {
+			return nil, fmt.Errorf("%w: token not active yet", ErrInvalidToken)
 		}
 	}
 
