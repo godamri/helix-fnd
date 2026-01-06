@@ -3,6 +3,7 @@ package response
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -56,12 +57,9 @@ func write(w http.ResponseWriter, status int, payload interface{}) {
 }
 
 func getTraceID(r *http.Request) string {
-	// Assuming OpenTelemetry or a middleware has injected it into the context or header.
-	// Fallback to generating one if missing (for debugging).
-	// In a real OTel setup, extracting from context is preferred.
 	tid := r.Header.Get("X-Trace-Id")
 	if tid == "" {
-		tid = uuid.New().String() // Fallback
+		tid = strings.ReplaceAll(uuid.New().String(), "-", "")
 	}
 	return tid
 }

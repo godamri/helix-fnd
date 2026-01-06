@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"encoding/hex"
 	"net/http"
 
 	"github.com/godamri/helix-fnd/pkg/contextx"
@@ -16,7 +17,8 @@ func TraceIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		traceID := r.Header.Get(TraceHeader)
 		if traceID == "" {
-			traceID = uuid.NewString()
+			uid := uuid.New()
+			traceID = hex.EncodeToString(uid[:])
 		}
 
 		reqID := r.Header.Get(RequestHeader)
