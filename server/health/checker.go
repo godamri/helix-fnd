@@ -2,7 +2,6 @@ package health
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -10,14 +9,15 @@ import (
 	"log/slog"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Checker struct {
-	db     *sql.DB
+	db     *pgxpool.Pool
 	logger *slog.Logger
 }
 
-func NewChecker(db *sql.DB, logger *slog.Logger) *Checker {
+func NewChecker(db *pgxpool.Pool, logger *slog.Logger) *Checker {
 	return &Checker{
 		db:     db,
 		logger: logger,
@@ -41,7 +41,7 @@ func (c *Checker) HandleReadiness(w http.ResponseWriter, r *http.Request) {
 	status := "UP"
 	statusCode := http.StatusOK
 
-	if err := c.db.PingContext(ctx); err != nil {
+	if err := c.db.Ping(ctx); err != nil {
 		c.logger.Error("readiness check failed: database unreachable or slow", "error", err)
 		status = "DOWN"
 		statusCode = http.StatusServiceUnavailable
