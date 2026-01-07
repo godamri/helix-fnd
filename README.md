@@ -1,43 +1,94 @@
-Helix Platform Foundation
-==================
+Helix Foundation (FND)
+======================
 
-**Standard Infrastructure Library for Helix Microservices**
+> **Mission-Critical Go Microservices Framework** *High-Reliability Architecture. Semantic-Audit Ready. Zero-Compromise Consistency.*
 
-`helix-fnd` is a shared library providing a standardized infrastructure foundation for all microservices within the Helix ecosystem. Its primary goal is to eliminate boilerplate code, enforce engineering standards (logging, tracing, config), and ensure every service is "production-ready" from day one.
+Helix FND is a **robust defensive framework** engineered to build microservices that prioritize stability, data integrity, and error prevention above all else.
 
-📦 Key Features
----------------
+Built upon the principles of **Observability-First** and **Defense-in-Depth**, this framework provides the necessary guardrails to ensure operations are accurately accounted for, errors are transparently reported, and state mutations are fully traceable in complex distributed systems.
 
--   **Application Bootstrap (`app`)**: Standardized graceful startup/shutdown via `Runner`.
+Core Capabilities
+-----------------
 
--   **Configuration (`config`)**: Environment variable loading & validation using `envconfig` + `validator`.
+### 1\. Transport & Resilience Layer
 
--   **Database (`database`)**: `sql.DB` wrapper with automated *Connection Pooling* and *OpenTelemetry Tracing*.
+The first line of defense for ingress traffic, designed to withstand chaotic environments and traffic spikes.
 
--   **Server (`server`)**: HTTP & gRPC servers pre-configured with standard middleware (Recovery, Logging, Auth, OTel).
+-   **Hybrid Server Lifecycle:** Seamlessly orchestrates HTTP (Chi) and gRPC (Google) servers within a unified, signal-aware `Runner`.
 
--   **Logging (`log`)**: Structured JSON logger (`slog`) with automatic Trace ID injection.
+-   **Zero-Trust mTLS:** Native support for Mutual TLS (Client Certificate Auth) to enforce strict service-to-service identity verification.
 
--   **Messaging (`messaging`)**: Kafka Producer wrapper with OTel context propagation.
+-   **GCRA Rate Limiter:** High-precision implementation of the *Generic Cell Rate Algorithm* using Lua scripts in Redis.
 
--   **Crypto (`crypto`)**: Helpers for Password Hashing (Bcrypt) and JWKS Caching Client.
+    -   *Circuit Breaker Fallback:* In the event of a Redis outage, the limiter automatically degrades to an *in-memory token bucket* strategy (Fail-Safe) to prevent system lockout while maintaining protection.
 
--   **Caching (`cache`)**: Redis client wrapper with fail-fast connectivity checks.
+-   **Idempotency Gate:** A dedicated middleware ensuring strict exactly-once processing for critical operations using atomic Redis locks (`SetNX`), preventing duplicate execution and race conditions in distributed environments.
 
-🚀 Installation
----------------
+### 2\. Deep Observability
+
+Comprehensive telemetry integration for complete system visibility, from the edge to the database.
+
+-   **Integrated Telemetry:** Custom `slog` handler wrapped with `OTelHandler`.
+
+    -   **Context injection:** Automatically injects `trace_id` and `span_id` into every log entry.
+
+    -   **Auto-Error Recording:** Automatically marks the active OpenTelemetry Span as `Error` and records the exception stack trace whenever a log level of `ERROR` or higher is detected.
+
+-   **RED Metrics:** Middleware that automatically captures Request Rate, Error Rate, and Duration via Prometheus, implemented with cardinality protection to prevent metric explosion.
+
+-   **Distributed Tracing:** Full propagation of Trace Context across HTTP, gRPC, and Kafka headers, ensuring no request is lost in the void.
+
+### 3\. High-Integrity Audit
+
+An immutable audit trail designed for strict compliance and system accountability.
+
+-   **Configurable Buffer Strategies:**
+
+    -   **High Availability:** Drops log events if the buffer is full (Non-blocking / Best-effort).
+
+    -   **High Integrity:** Blocks the main thread if the buffer is full (Guarantees *no-audit-loss* at the cost of latency).
+
+-   **Multi-Output Support:** Native integration with Kafka (via `franz-go`) using Snappy batch compression for high throughput, with automatic fallback to `io.Writer` (stdout/file).
+
+### 4\. Event Driven Architecture
+
+Engineered for strict ordering, high throughput, and eventual consistency.
+
+-   **Synchronous Kafka Producer:** Utilizes `ProduceSync` to guarantee message persistence, making it ideal for the **Transactional Outbox** pattern where event loss is unacceptable.
+
+-   **Resilient Consumer:**
+
+    -   **Strict Ordering:** Ensures messages are processed in the exact order they were received.
+
+    -   **Dead Letter Queue (DLQ):** Automatically quarantines "poison pill" messages after `MaxRetries` is exceeded, preventing consumer lag accumulation.
+
+    -   **Exponential Backoff:** Intelligent retry mechanism for transient failures.
+
+-   **Trace Propagation:** Context tracing is automatically injected into and extracted from Kafka Record Headers.
+
+### 5\. Security & Identity
+
+-   **JWKS Caching Client:** High-performance JWT validation featuring background key refresh, stale-cache tolerance, and `singleflight` protection to prevent "thundering herd" attacks on identity providers.
+
+-   **Bcrypt Wrapper:** Standardized password hashing with enforceable cost parameters.
+
+### 6\. Data Persistence
+
+-   **PostgreSQL (pgxpool):** Production-ready connection pool tuning with native OpenTelemetry instrumentation at the driver level.
+
+-   **Redis (go-redis):** Automatic tracing hooks for every command and pipeline execution.
+
+Quick Start
+-----------
+
+### Installation
 
 ```
-go get [github.com/godamri/helix-fnd@v0.1.0](https://github.com/godamri/helix-fnd@v0.1.0)
+go get github.com/godamri/helix-fnd
 
 ```
 
-📖 Usage Guide
---------------
-
-### 1\. Bootstrap Service (`main.go`)
-
-Use `app.Runner` to manage the application lifecycle.
+### Bootstrapping a Service
 
 ```
 package main
@@ -46,119 +97,60 @@ import (
 	"context"
 	"log/slog"
 	
-	"[github.com/godamri/helix-fnd/app](https://github.com/godamri/helix-fnd/app)"
-	"[github.com/godamri/helix-fnd/log](https://github.com/godamri/helix-fnd/log)"
+	"github.com/godamri/helix-fnd/app"
+	"github.com/godamri/helix-fnd/server"
+	"github.com/godamri/helix-fnd/log"
 )
+
+type Config struct {
+    Server server.Config
+    Log    log.Config
+}
 
 func main() {
-	// Init Logger
-	logger := log.New(log.Config{Level: "info", Format: "json"})
-	slog.SetDefault(logger)
+    // 1. Initialize Logger with OTel support
+    logger := log.New(log.Config{Level: "info", Format: "json"})
 
-	// Init Runner
-	runner := app.NewRunner(logger)
+    // 2. Lifecycle Runner
+    runner := app.NewRunner(logger)
 
-	runner.Run(func(ctx context.Context) error {
-		logger.Info("Service started!")
-		
-		// ... Init DB, Server, Workers here ...
-		
-		return nil // Block here if needed, or return nil for cleanup
-	})
+    runner.Run(func(ctx context.Context) error {
+        // Load Config with strict validation
+        var cfg Config
+        loader := app.NewConfigLoader()
+        if err := loader.Load(ctx, &cfg, "MYAPP"); err != nil {
+            return err
+        }
+
+        // Start Server (HTTP + gRPC)
+        // Dependencies are injected here
+        srv := server.New(cfg.Server, logger, myRouter, myGrpcServer)
+        return srv.Start(ctx)
+    })
 }
 
 ```
 
-### 2\. Database Connection
+Configuration Standards
+-----------------------
 
-Automatically integrated with OpenTelemetry.
+All configurations are loaded via `envconfig` with strict type enforcement and validation.
 
-```
-import "[github.com/godamri/helix-fnd/database](https://github.com/godamri/helix-fnd/database)"
+| Category | Env Variable | Default | Description |
+| --- |  --- |  --- |  --- |
+| **DB** | `DB_DSN` | \- | PostgreSQL Connection String (DSN) |
+| **DB** | `DB_MAX_OPEN_CONNS` | `50` | Database connection pool size |
+| **Redis** | `REDIS_ADDR` | \- | Redis Host:Port |
+| **App** | `LOG_LEVEL` | `info` | Logging level: `debug`, `info`, `warn`, `error` |
+| **Audit** | `AUDIT_BLOCK_ON_FULL` | `false` | Set to `true` for critical paths where audit loss is unacceptable |
 
-func initDB(ctx context.Context) (*sql.DB, error) {
-	cfg := database.Config{
-		DSN: "postgres://user:pass@localhost:5432/db?sslmode=disable",
-	}
-	return database.NewPostgres(ctx, cfg, "my-service-name")
-}
+Architecture Decisions
+----------------------
 
-```
+1.  **Fail-Fast Philosophy:** All critical dependencies (Redis, Postgres, Kafka) are pinged immediately upon startup. If any service is unreachable, the application panics instantly. We do not allow "zombie states" where the app is running but non-functional.
 
-### 3\. HTTP Server
+2.  **Context is King:** Every critical function (Logging, Database, HTTP Requests) requires `context.Context` to ensure proper tracing propagation and cancellation signals.
 
-Automatically attaches middleware: Panic Recovery, OTel Tracing, Logging, Security Headers.
+3.  **No Magic:** There is no hidden global state. All dependencies must be explicitly injected via constructors.
 
-```
-import (
-	"[github.com/go-chi/chi/v5](https://github.com/go-chi/chi/v5)"
-	"[github.com/godamri/helix-fnd/server](https://github.com/godamri/helix-fnd/server)"
-)
-
-func initServer(logger *slog.Logger) {
-	r := chi.NewRouter()
-	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello Helix!"))
-	})
-
-	// Setup Server Config (Port, Timeout, etc.)
-	cfg := server.Config{Port: "8080"}
-	
-	// Server Wrapper
-	srv := server.New(cfg, logger, r, nil) // nil because gRPC is disabled
-	
-	// Start (Blocking)
-	srv.Start(context.Background())
-}
-
-```
-
-### 4\. Authentication (JWKS)
-
-Validate JWT Tokens by dynamically fetching Public Keys from the Auth Service.
-
-```
-import (
-	"[github.com/godamri/helix-fnd/crypto](https://github.com/godamri/helix-fnd/crypto)"
-	"[github.com/godamri/helix-fnd/server/middleware](https://github.com/godamri/helix-fnd/server/middleware)"
-)
-
-func setupAuth(logger *slog.Logger) {
-	// Init JWKS Client
-	jwks, _ := crypto.NewJWKSCachingClient(
-		"http://auth-service/.well-known/jwks.json",
-		"helix-auth-service",
-		5*time.Minute,
-		logger,
-	)
-	
-	// Create Middleware Factory
-	authFactory := middleware.NewAuthMiddlewareFactory(jwks)
-	
-	// Use in Router
-	r.Use(authFactory.HTTPMiddleware)
-}
-
-```
-
-🛡️ Resilience Philosophy
--------------------------
-
-This Foundation is designed with the **"Fail Fast, Recover Safe"** principle:
-
-1.  **Startup**: If config is invalid or DB is unreachable on start -> **Panic/Exit** (Fail Fast). Ensures failed deployments are detected immediately.
-
-2.  **Runtime**: If a panic occurs in a handler -> **Recover & Log** (Recover Safe). Prevents a single bad request from crashing the entire pod.
-
-🤝 Contribution
----------------
-
-1.  Clone repo.
-
-2.  Create a feature branch.
-
-3.  Ensure `go mod tidy` runs and linters pass.
-
-4.  Submit PR.
-
-*Built for Helix Platform Ecosystem.*
+> *"No incomplete logic survives."*

@@ -44,20 +44,13 @@ func (s *JWTStrategy) Authenticate(ctx context.Context, payload AuthPayload) (co
 		return nil, errors.New("invalid token")
 	}
 
-	ctx = contextx.WithAuthMethod(ctx, "jwt")
-
 	if claims.ID != "" {
-		ctx = contextx.WithSessionID(ctx, claims.ID)
+		ctx = contextx.WithAuthSessionID(ctx, claims.ID)
 	}
 
-	ctx = contextx.WithIdentity(
-		ctx,
-		claims.Subject,        // UserID
-		claims.OrgID,          // OrgID
-		claims.Email,          // Email
-		claims.GetActorType(), // human | service | system
-		claims.GetRoles(),     // Roles/Permissions
-	)
+	if claims.Subject != "" {
+		ctx = contextx.WithAuthPrincipalID(ctx, claims.Subject)
+	}
 
 	return ctx, nil
 }

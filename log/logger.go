@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/godamri/helix-fnd/pkg/telemetry"
 	"github.com/lmittmann/tint"
 )
 
@@ -65,6 +66,6 @@ func New(cfg Config) *slog.Logger {
 			ReplaceAttr: Redactor,
 		})
 	}
-
+	handler = telemetry.NewOTelHandler(handler)
 	return slog.New(handler)
 }

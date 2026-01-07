@@ -54,10 +54,12 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start HTTP Server
 	if s.cfg.EnableHTTP {
 		s.httpSrv = &http.Server{
-			Addr:         ":" + s.cfg.HTTPPort,
-			Handler:      s.router,
-			ReadTimeout:  s.cfg.HTTPReadTimeout,
-			WriteTimeout: s.cfg.HTTPWriteTimeout,
+			Addr:              ":" + s.cfg.HTTPPort,
+			Handler:           s.router,
+			ReadTimeout:       s.cfg.HTTPReadTimeout,
+			ReadHeaderTimeout: 5 * time.Second,
+			WriteTimeout:      s.cfg.HTTPWriteTimeout,
+			IdleTimeout:       120 * time.Second,
 		}
 
 		if s.cfg.MTLSEnabled {

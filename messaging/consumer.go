@@ -8,25 +8,24 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
+
+const instrumentationName = "github.com/godamri/helix-fnd/messaging"
 
 // ConsumerConfig holds configuration for the Kafka consumer.
 type ConsumerConfig struct {
-	Brokers []string
-	GroupID string
-	Topic   string
-	// MaxRetries: 0 = infinite retries (Blocking until success)
-	MaxRetries int
-	// Backoff configuration
+	Brokers        []string
+	GroupID        string
+	Topic          string
+	MaxRetries     int
 	InitialBackoff time.Duration
 	MaxBackoff     time.Duration
-	// DLQ Topic Name (Optional, but highly recommended)
-	DLQTopic string
-
-	// StrictMode determines behavior on critical failures (e.g. DLQ Unreachable).
-	// True  = Panic/Exit (Consistency Priority)
-	// False = Log & Drop (Availability Priority)
-	StrictMode bool
+	DLQTopic       string
+	StrictMode     bool
 }
 
 type HandlerFunc func(ctx context.Context, key, payload []byte) error
@@ -42,6 +41,7 @@ type Consumer struct {
 	cfg         ConsumerConfig
 	handler     HandlerFunc
 	dlqProducer DLQProducer
+	tracer      trace.Tracer
 }
 
 // NewConsumer creates a consumer.
@@ -77,6 +77,7 @@ func NewConsumer(cfg ConsumerConfig, logger *slog.Logger, handler HandlerFunc, d
 		cfg:         cfg,
 		handler:     handler,
 		dlqProducer: dlq,
+		tracer:      otel.Tracer(instrumentationName),
 	}, nil
 }
 
@@ -104,11 +105,32 @@ func (c *Consumer) Start(ctx context.Context) error {
 		for !iter.Done() {
 			record := iter.Next()
 
+			carrier := propagation.MapCarrier{}
+			for _, h := range record.Headers {
+				carrier[h.Key] = string(h.Value)
+			}
+			ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
+
+			ctx, span := c.tracer.Start(ctx, "kafka.process",
+				trace.WithSpanKind(trace.SpanKindConsumer),
+				trace.WithAttributes(
+					attribute.String("messaging.system", "kafka"),
+					attribute.String("messaging.destination", record.Topic),
+					attribute.String("messaging.kafka.consumer_group", c.cfg.GroupID),
+					attribute.Int64("messaging.kafka.partition", int64(record.Partition)),
+					attribute.Int64("messaging.kafka.offset", record.Offset),
+					attribute.String("messaging.kafka.key", string(record.Key)),
+				),
+			)
+
 			// BLOCKING PROCESS WITH RETRY
 			if err := c.processWithRetry(ctx, record); err != nil {
+				span.RecordError(err)
+				span.End()
 				// Fatal error (e.g. context cancelled or DLQ failure in STRICT MODE), stop consumer
 				return err
 			}
+			span.End()
 
 			// COMMIT
 			if err := c.client.CommitRecords(ctx, record); err != nil {
@@ -181,7 +203,7 @@ func (c *Consumer) processWithRetry(ctx context.Context, record *kgo.Record) err
 			return nil
 		}
 
-		c.logger.Warn("Transient failure, retrying...",
+		c.logger.WarnContext(ctx, "Transient failure, retrying...",
 			"attempt", attempt,
 			"error", err,
 			"backoff", backoff.String(),

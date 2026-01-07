@@ -1,0 +1,72 @@
+run:
+  concurrency: 4
+  timeout: 5m
+  issues-exit-code: 1
+  tests: true
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - experimental
+      - opinionated
+      - performance
+      - style
+    disabled-checks:
+      - whyNoLint
+  gocyclo:
+    min-complexity: 15 # Keep functions simple!
+  gofumpt:
+    extra-rules: true
+  govet:
+    check-shadowing: true
+  misspell:
+    locale: US
+  nolintlint:
+    allow-unused: false # Report unused nolint directives
+    require-explanation: true # Force explanation why you skipped a check
+    require-specific: true
+
+linters:
+  disable-all: true
+  enable:
+    - bodyclose     # Checks whether HTTP response body is closed successfully
+    - dogsled       # Checks assignments with too many blank identifiers
+    - dupl          # Tool for code clone detection
+    - errcheck      # Errcheck is a program for checking for unchecked errors
+    - errorlint     # errorlint is a linter for that can be used to find code that will cause problems with the error wrapping scheme introduced in Go 1.13
+    - exportloopref # Checks for pointers to enclosing loop variables
+    - goconst       # Finds repeated strings that could be replaced by a constant
+    - gocritic      # Provides many diagnostics that check for bugs, performance and style issues
+    - gocyclo       # Computes and checks the cyclomatic complexity of functions
+    - gofmt         # Gofmt checks whether code was gofmt-ed
+    - gofumpt       # Gofumpt checks whether code was gofumpt-ed
+    - goimports     # Goimports does everything that gofmt does. Additionally it checks unused imports
+    - gosec         # Inspects source code for security problems
+    - gosimple      # Linter for Go source code that specializes in simplifying a code
+    - govet         # Vet examines Go source code and reports suspicious constructs
+    - ineffassign   # Detects when assignments to existing variables are not used
+    - misspell      # Finds commonly misspelled English words in comments
+    - nakedret      # Finds naked returns in functions greater than a specified function length
+    - prealloc      # Finds slice declarations that could potentially be preallocated
+    - staticcheck   # Staticcheck is a go vet on steroids
+    - stylecheck    # Stylecheck is a replacement for golint
+    - typecheck     # Like the front-end of a Go compiler, parses and type-checks code
+    - unconvert     # Remove unnecessary type conversions
+    - unparam       # Reports unused function parameters
+    - unused        # Checks Go code for unused constants, variables, functions and types
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gocyclo
+        - errcheck
+        - dupl
+        - gosec

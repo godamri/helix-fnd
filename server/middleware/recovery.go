@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+
+	"github.com/godamri/helix-fnd/http/response"
 )
 
 func PanicRecovery(next http.Handler) http.Handler {
@@ -19,8 +21,7 @@ func PanicRecovery(next http.Handler) http.Handler {
 					"path", r.URL.Path,
 					"stack", stack,
 				)
-
-				http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
+				response.ErrorJSON(w, r, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred")
 			}
 		}()
 		next.ServeHTTP(w, r)
