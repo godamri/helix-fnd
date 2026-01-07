@@ -3,27 +3,10 @@ package middleware
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"strings"
 
-	"github.com/godamri/helix-fnd/crypto"
 	"github.com/godamri/helix-fnd/pkg/contextx"
 )
-
-type JWTStrategy struct {
-	verifier crypto.JWKSVerifier
-	logger   *slog.Logger
-}
-
-func NewJWTStrategy(verifier crypto.JWKSVerifier, logger *slog.Logger) *JWTStrategy {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	return &JWTStrategy{
-		verifier: verifier,
-		logger:   logger,
-	}
-}
 
 func (s *JWTStrategy) Authenticate(ctx context.Context, payload AuthPayload) (context.Context, error) {
 	authHeader := payload.GetHeader("Authorization")
