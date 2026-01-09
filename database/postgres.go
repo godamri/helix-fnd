@@ -15,25 +15,29 @@ import (
 
 // Config holds standard database configuration.
 type Config struct {
-	DSN         string        `envconfig:"DB_DSN" required:"true"`
-	MaxConns    int32         `envconfig:"DB_MAX_OPEN_CONNS" default:"50"`
-	MinConns    int32         `envconfig:"DB_MIN_IDLE_CONNS" default:"10"`
-	MaxConnLife time.Duration `envconfig:"DB_CONN_MAX_LIFETIME" default:"30m"`
-	MaxConnIdle time.Duration `envconfig:"DB_CONN_MAX_IDLE_TIME" default:"15m"`
+	DBDSN             string        `envconfig:"DB_DSN" required:"true"`
+	DBMaxConns        int32         `envconfig:"DB_MAX_OPEN_CONNS" default:"50"`
+	DBMinConns        int32         `envconfig:"DB_MIN_IDLE_CONNS" default:"10"`
+	DBMaxConnIdle     time.Duration `envconfig:"DB_CONN_MAX_LIFETIME" default:"30m"`
+	DBMaxConnLife     time.Duration `envconfig:"DB_CONN_MAX_IDLE_TIME" default:"15m"`
+	DBConnectTimeout  time.Duration `envconfig:"DB_CONN_TIMEOUT" default:"15m"`
+	HealthCheckPeriod time.Duration `envconfig:"DB_HEALTHCHECK_PERIOD" default:"1m"`
 }
 
 // NewPostgres initializes a *pgxpool.Pool.
 func NewPostgres(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
-	poolConfig, err := pgxpool.ParseConfig(cfg.DSN)
+	poolConfig, err := pgxpool.ParseConfig(cfg.DBDSN)
 	if err != nil {
-		return nil, fmt.Errorf("database: failed to parse DSN: %w", err)
+		return nil, fmt.Errorf("database: failed to parse DBDSN: %w", err)
 	}
 
 	// Tuning Pool
-	poolConfig.MaxConns = cfg.MaxConns
-	poolConfig.MinConns = cfg.MinConns
-	poolConfig.MaxConnLifetime = cfg.MaxConnLife
-	poolConfig.MaxConnIdleTime = cfg.MaxConnIdle
+	poolConfig.MaxConns = cfg.DBMaxConns
+	poolConfig.MinConns = cfg.DBMinConns
+	poolConfig.MaxConnLifetime = cfg.DBMaxConnLife
+	poolConfig.MaxConnIdleTime = cfg.DBMaxConnIdle
+	poolConfig.ConnConfig.ConnectTimeout = cfg.DBConnectTimeout
+	poolConfig.HealthCheckPeriod = cfg.HealthCheckPeriod
 
 	poolConfig.ConnConfig.Tracer = &otelPgxTracer{
 		tracer: otel.Tracer("helix-fnd/database"),
