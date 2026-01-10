@@ -44,12 +44,12 @@ func (s *JWTStrategy) Authenticate(ctx context.Context, payload AuthPayload) (co
 		return nil, errors.New("invalid token")
 	}
 
-	if claims.ID != "" {
-		ctx = contextx.WithAuthSessionID(ctx, claims.ID)
-	}
-
 	if claims.Subject != "" {
 		ctx = contextx.WithAuthPrincipalID(ctx, claims.Subject)
+	}
+
+	if claims.Sid != "" {
+		ctx = contextx.WithAuthSessionID(ctx, claims.Sid)
 	}
 
 	return ctx, nil
