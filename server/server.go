@@ -24,11 +24,11 @@ type Config struct {
 	HTTPWriteTimeout time.Duration
 	ShutdownTimeout  time.Duration
 
-	// mTLS Configuration
-	MTLSEnabled    bool
-	MTLSCACert     string // Path to CA Certificate
-	MTLSServerCert string // Path to Server Certificate
-	MTLSServerKey  string // Path to Server Key
+	HTTPMTLSEnabled    bool
+	HTTPMTLSCACert     string // Path to CA Certificate for client verification
+	HTTPMTLSServerCert string // Path to Server Certificate
+	HTTPMTLSServerKey  string // Path to Server Key
+	GRPCMTLSEnabled    bool
 }
 
 type Server struct {
@@ -62,20 +62,20 @@ func (s *Server) Start(ctx context.Context) error {
 			IdleTimeout:       120 * time.Second,
 		}
 
-		if s.cfg.MTLSEnabled {
+		if s.cfg.HTTPMTLSEnabled {
 			s.logger.Info("Enabling mTLS for HTTP Server")
-			tlsConfig, err := loadMTLSConfig(s.cfg.MTLSCACert)
+			tlsConfig, err := loadMTLSConfig(s.cfg.HTTPMTLSCACert)
 			if err != nil {
-				return fmt.Errorf("failed to load mTLS config: %w", err)
+				return fmt.Errorf("failed to load HTTP mTLS config: %w", err)
 			}
 			s.httpSrv.TLSConfig = tlsConfig
 		}
 
 		go func() {
-			s.logger.Info("HTTP server starting", "port", s.cfg.HTTPPort, "mtls", s.cfg.MTLSEnabled)
+			s.logger.Info("HTTP server starting", "port", s.cfg.HTTPPort, "mtls", s.cfg.HTTPMTLSEnabled)
 			var err error
-			if s.cfg.MTLSEnabled {
-				err = s.httpSrv.ListenAndServeTLS(s.cfg.MTLSServerCert, s.cfg.MTLSServerKey)
+			if s.cfg.HTTPMTLSEnabled {
+				err = s.httpSrv.ListenAndServeTLS(s.cfg.HTTPMTLSServerCert, s.cfg.HTTPMTLSServerKey)
 			} else {
 				err = s.httpSrv.ListenAndServe()
 			}
@@ -88,7 +88,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start gRPC Server
 	if s.cfg.EnableGRPC {
 		go func() {
-			s.logger.Info("gRPC server starting", "port", s.cfg.GRPCPort)
+			s.logger.Info("gRPC server starting", "port", s.cfg.GRPCPort, "mtls", s.cfg.GRPCMTLSEnabled)
 			lis, err := SystemSocket(s.cfg.GRPCPort)
 			if err != nil {
 				errChan <- fmt.Errorf("failed to listen grpc: %w", err)
